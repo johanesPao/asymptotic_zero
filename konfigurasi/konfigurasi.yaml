@@ -1,0 +1,148 @@
+# Konfigurasi Agen Trading DQN Kripto
+
+data:
+  # Sumber data
+  sumber: "binance" # Menggunakan data publik Binance
+
+  # Simbol yang akan didownload (pasangan trading terlikuid)
+  simbol:
+    - "BTCUSDT"
+    - "ETHUSDT"
+    - "BNBUSDT"
+    - "SOLUSDT"
+    - "XRPUSDT"
+    - "ADAUSDT"
+    - "DOGEUSDT"
+    - "MATICUSDT"
+    - "DOTUSDT"
+    - "AVAXUSDT"
+    - "LINKUSDT"
+    - "ATOMUSDT"
+    - "UNIUSDT"
+    - "LTCUSDT"
+    - "ETCUSDT"
+    - "NEARUSDT"
+    - "ALGOUSDT"
+    - "VETUSDT"
+    - "ICPUSDT"
+    - "FILUSDT"
+
+  # Rentang tanggal untuk data historis
+  tanggal_mulai: "2020-01-01"
+  tanggal_selesai: "2024-11-30"
+
+  # Interval dasar (granularitas terkecil)
+  interval_dasar: "1m"
+
+  # Timeframe yang akan dibuat
+  timeframe:
+    - "5m"
+    - "15m"
+    - "1h"
+    - "4h"
+    - "1d"
+
+  # Direktori
+  direktori_data_mentah: "data/mentah"
+  direktori_data_proses: "data/proses"
+  direktori_data_fitur: "data/fitur"
+
+fitur:
+  # Indikator teknikal yang akan dihitung
+  indikator:
+    # Moving Averages
+    - nama: "sma"
+      periode: [7, 14, 21, 50, 200]
+    - nama: "ema"
+      periode: [9, 12, 21, 26, 50]
+
+    # Momentum
+    - nama: "rsi"
+      periode: [14, 21]
+    - nama: "macd"
+      cepat: 12
+      lambat: 26
+      sinyal: 9
+    - nama: "stochastic"
+      periode_k: 14
+      periode_d: 3
+
+    # Volatilitas
+    - nama: "bollinger_bands"
+      periode: 20
+      std: 2
+    - nama: "atr"
+      periode: 14
+    - nama: "keltner_channels"
+      periode: 20
+      atr_mult: 2
+
+    # Volume
+    - nama: "volume_sma"
+      periode: [20, 50]
+    - nama: "vwap"
+    - nama: "mfi"
+      periode: 14
+
+    # Trend
+    - nama: "adx"
+      periode: 14
+    - nama: "cci"
+      periode: 20
+    - nama: "ichimoku"
+
+    # Pola harga
+    - nama: "perubahan_harga"
+      periode: [1, 4, 24, 168] # 1j, 4j, 1h, 1m (dalam jam untuk timeframe 1h)
+    - nama: "support_resistance"
+
+  # Normalisasi
+  normalisasi: true
+  metode: "minmax" # atau "zscore"
+
+pelatihan:
+  # Timeframe utama untuk keputusan
+  timeframe_keputusan: "15m"
+
+  # Panjang episode (dalam candle)
+  panjang_episode: 672 # 7 hari pada interval 15 menit
+
+  # Pembagian train/validation/test
+  pembagian_train: 0.7
+  pembagian_val: 0.15
+  pembagian_test: 0.15
+
+lingkungan:
+  # Pengaturan portofolio
+  saldo_awal: 10000
+  posisi_maksimal: 3
+  ukuran_posisi_maksimal: 0.33
+  eksposur_total_maksimal: 0.8
+  cadangan_tunai_minimal: 0.2
+
+  # Biaya trading
+  biaya_trading: 0.001 # 0.1% per trade
+  slippage: 0.0005 # 0.05% slippage
+
+  # Manajemen risiko
+  leverage_maksimal: 1.0 # 1x (tanpa leverage untuk saat ini)
+  threshold_likuidasi: 0.9
+
+agen:
+  # Parameter DQN
+  learning_rate: 0.0001
+  gamma: 0.99
+  epsilon_awal: 1.0
+  epsilon_akhir: 0.01
+  epsilon_decay: 0.9995
+
+  # Memori
+  ukuran_replay_buffer: 100000
+  ukuran_batch: 32
+
+  # Network
+  hidden_layers: [512, 256, 128]
+
+  # Pelatihan
+  frekuensi_update_target: 1000
+  frekuensi_simpan: 10000

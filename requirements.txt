@@ -1,0 +1,20 @@
+# Dependensi untuk Data Pipeline
+pandas==2.3.3
+polars==1.36.1
+numpy==2.2.6
+pyarrow==22.0.0
+requests==2.32.5
+tqdm==4.67.1
+
+# Dependensi untuk indikator teknikal
+ta==0.11.0
+pandas-ta==0.4.71b0
+
+# Dependensi untuk DQN
+tensorflow==2.20.0
+gym==0.26.2
+
+# Utilitas
+python-dotenv==1.2.1
+PyYAML==6.0.3
+loguru==0.7.3
