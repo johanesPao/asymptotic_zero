@@ -4,7 +4,7 @@ Agregator Timeframe
 Mengkonversi data 1-menit ke berbagai timeframe di atasnya (5m, 15m, 1h, 4h, 1d).
 """
 
-import pandas as pd
+import polars as pl
 from pathlib import Path
 from typing import List
 import logging
@@ -47,7 +47,7 @@ class AgregatorTimeframe:
         self.direktori_output = Path(direktori_output)
         self.direktori_output.mkdir(parents=True, exist_ok=True)
 
-    def _resample_ohlcv(self, df: pd.DataFrame, timeframe: str) -> pd.DataFrame:
+    def _resample_ohlcv(self, df: pl.DataFrame, timeframe: str) -> pl.DataFrame:
         """
         Resample data OHLCV ke timeframe berbeda.
 
@@ -64,19 +64,19 @@ class AgregatorTimeframe:
         aturan = self.PETA_TIMEFRAME[timeframe]
 
         # Resample dengan fungsi agregasi yang sesuai
-        df_agregasi = df.resample(aturan).agg(
-            {
-                "buka": "first",  # Buka pertama dalam periode
-                "tinggi": "max",  # Harga tertinggi
-                "rendah": "min",  # Harga terendah
-                "tutup": "last",  # Tutup terakhir
-                "volume": "sum",  # Total volume
-                "jumlah_trade": "sum",  # Total trade
-            }
+        df_agregasi = df.group_by_dynamic("waktu_buka", every=aturan).agg(
+            [
+                pl.col("buka").first(),  # Buka pertama dalam periode
+                pl.col("tinggi").max(),  # Harga tertinggi
+                pl.col("rendah").min(),  # Harga terendah
+                pl.col("tutup").last(),  # Tutup terakhir
+                pl.col("volume").sum(),  # Total volume
+                pl.col("jumlah_trade").sum(),  # Total trade
+            ]
         )
 
         # Hapus candle yang tidak lengkap (baris terakhir mungkin tidak lengkap)
-        df_agregasi = df_agregasi.dropna()
+        df_agregasi = df_agregasi.drop_nulls()
 
         return df_agregasi
 
@@ -108,14 +108,14 @@ class AgregatorTimeframe:
             logger.error(f"File sumber tidak ditemukan: {file_sumber}")
             return
 
-        df = pd.read_parquet(file_sumber)
+        df = pl.read_parquet(file_sumber)
 
         # Pastikan waktu_buka adalah datetime
-        if not pd.api.types.is_datetime64_any_dtype(df["waktu_buka"]):
-            df["waktu_buka"] = pd.to_datetime(df["waktu_buka"])
+        if df["waktu_buka"].dtype != pl.Datetime:
+            df = df.with_columns(pl.col("waktu_buka").str.to_datetime())
 
-        # Set indeks ke waktu_buka untuk resampling
-        df = df.set_index("waktu_buka")
+        # Sort by waktu_buka untuk resampling
+        df = df.sort("waktu_buka")
 
         # Agregasi ke setiap timeframe target
         for tf_target in daftar_timeframe_target:
@@ -124,7 +124,7 @@ class AgregatorTimeframe:
 
                 # Simpan ke parquet
                 file_output = self.direktori_output / f"{simbol}_{tf_target}.parquet"
-                df_agregasi.reset_index().to_parquet(file_output, index=False)
+                df_agregasi.write_parquet(file_output)
 
                 logger.info(f"Dibuat {file_output} dengan {len(df_agregasi)} candle")
             except Exception as e:

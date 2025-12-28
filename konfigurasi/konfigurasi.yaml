@@ -1,10 +1,25 @@
-# Konfigurasi Agen Trading DQN Kripto
+# =============================================================================
+# KONFIGURASI DQN CRYPTO TRADING
+# =============================================================================
+# Semua parameter dapat diubah di sini.
+# InsinyurFitur akan merge config ini dengan default values.
+# Anda TIDAK perlu mendefinisikan semua parameter - hanya yang ingin di-override.
+# =============================================================================
 
+# -----------------------------------------------------------------------------
+# DATA SETTINGS
+# -----------------------------------------------------------------------------
 data:
-  # Sumber data
-  sumber: "binance" # Menggunakan data publik Binance
+  # Direktori penyimpanan
+  direktori_data_mentah: "data/mentah"
+  direktori_data_proses: "data/proses"
+  direktori_data_fitur: "data/fitur"
 
-  # Simbol yang akan didownload (pasangan trading terlikuid)
+  # Rentang waktu
+  tanggal_mulai: "2020-01-01"
+  tanggal_akhir: "2024-12-01"
+
+  # Daftar simbol
   simbol:
     - "BTCUSDT"
     - "ETHUSDT"
@@ -13,136 +28,196 @@ data:
     - "XRPUSDT"
     - "ADAUSDT"
     - "DOGEUSDT"
-    - "MATICUSDT"
     - "DOTUSDT"
-    - "AVAXUSDT"
+    - "MATICUSDT"
     - "LINKUSDT"
+    - "AVAXUSDT"
+    - "LTCUSDT"
     - "ATOMUSDT"
     - "UNIUSDT"
-    - "LTCUSDT"
-    - "ETCUSDT"
     - "NEARUSDT"
-    - "ALGOUSDT"
-    - "VETUSDT"
-    - "ICPUSDT"
-    - "FILUSDT"
+    - "ARBUSDT"
+    - "OPUSDT"
+    - "APTUSDT"
 
-  # Rentang tanggal untuk data historis
-  tanggal_mulai: "2020-01-01"
-  tanggal_selesai: "2024-11-30"
-
-  # Interval dasar (granularitas terkecil)
-  interval_dasar: "1m"
-
-  # Timeframe yang akan dibuat
-  timeframe:
-    - "5m"
-    - "15m"
+# -----------------------------------------------------------------------------
+# TRAINING SETTINGS
+# -----------------------------------------------------------------------------
+pelatihan:
+  timeframe_keputusan: "15m" # Timeframe utama untuk keputusan trading
+  timeframe_tambahan: # Timeframes untuk multi-timeframe analysis
     - "1h"
     - "4h"
     - "1d"
 
-  # Direktori
-  direktori_data_mentah: "data/mentah"
-  direktori_data_proses: "data/proses"
-  direktori_data_fitur: "data/fitur"
-
+# -----------------------------------------------------------------------------
+# FITUR / INDIKATOR TEKNIKAL
+# -----------------------------------------------------------------------------
+# Hanya definisikan parameter yang ingin di-override dari default.
+# Default values ada di InsinyurFitur._get_default_config()
+# -----------------------------------------------------------------------------
 fitur:
-  # Indikator teknikal yang akan dihitung
-  indikator:
-    # Moving Averages
-    - nama: "sma"
-      periode: [7, 14, 21, 50, 200]
-    - nama: "ema"
-      periode: [9, 12, 21, 26, 50]
+  # ===========================================================================
+  # MOVING AVERAGES
+  # ===========================================================================
+  sma_periods: [7, 14, 21, 50, 200]
+  ema_periods: [9, 12, 21, 26, 50]
+  wma_periods: [14, 21]
+  dema_periods: [14, 21]
+  tema_periods: [14, 21]
 
-    # Momentum
-    - nama: "rsi"
-      periode: [14, 21]
-    - nama: "macd"
-      cepat: 12
-      lambat: 26
-      sinyal: 9
-    - nama: "stochastic"
-      periode_k: 14
-      periode_d: 3
+  # ===========================================================================
+  # MOMENTUM INDICATORS
+  # ===========================================================================
+  rsi_periods: [14, 21]
 
-    # Volatilitas
-    - nama: "bollinger_bands"
-      periode: 20
-      std: 2
-    - nama: "atr"
-      periode: 14
-    - nama: "keltner_channels"
-      periode: 20
-      atr_mult: 2
+  macd:
+    cepat: 12
+    lambat: 26
+    sinyal: 9
 
-    # Volume
-    - nama: "volume_sma"
-      periode: [20, 50]
-    - nama: "vwap"
-    - nama: "mfi"
-      periode: 14
+  stochastic:
+    k_period: 14
+    d_period: 3
+    slowing: 3
 
-    # Trend
-    - nama: "adx"
-      periode: 14
-    - nama: "cci"
-      periode: 20
-    - nama: "ichimoku"
+  stochrsi:
+    timeperiod: 14
+    fastk_period: 5
+    fastd_period: 3
 
-    # Pola harga
-    - nama: "perubahan_harga"
-      periode: [1, 4, 24, 168] # 1j, 4j, 1h, 1m (dalam jam untuk timeframe 1h)
-    - nama: "support_resistance"
+  ultosc:
+    timeperiod1: 7
+    timeperiod2: 14
+    timeperiod3: 28
 
-  # Normalisasi
-  normalisasi: true
-  metode: "minmax" # atau "zscore"
+  cci_periods: [14, 20]
+  williams_r_period: 14
+  mfi_period: 14
+  roc_periods: [10, 21]
+  momentum_periods: [10, 21]
 
-pelatihan:
-  # Timeframe utama untuk keputusan
-  timeframe_keputusan: "15m"
+  # ===========================================================================
+  # VOLATILITY INDICATORS
+  # ===========================================================================
+  bollinger:
+    period: 20
+    std_dev: 2.0
 
-  # Panjang episode (dalam candle)
-  panjang_episode: 672 # 7 hari pada interval 15 menit
+  atr_periods: [14, 21]
+  natr_period: 14
 
-  # Pembagian train/validation/test
-  pembagian_train: 0.7
-  pembagian_val: 0.15
-  pembagian_test: 0.15
+  keltner:
+    ema_period: 20
+    atr_period: 10
+    multiplier: 2.0
 
-lingkungan:
-  # Pengaturan portofolio
-  saldo_awal: 10000
-  posisi_maksimal: 3
-  ukuran_posisi_maksimal: 0.33
-  eksposur_total_maksimal: 0.8
-  cadangan_tunai_minimal: 0.2
+  donchian_period: 20
 
-  # Biaya trading
-  biaya_trading: 0.001 # 0.1% per trade
-  slippage: 0.0005 # 0.05% slippage
+  # ===========================================================================
+  # VOLUME INDICATORS
+  # ===========================================================================
+  volume_ma_periods: [10, 20, 50]
+  volume_rasio_ma_period: 20 # Period untuk menghitung volume rasio
 
-  # Manajemen risiko
-  leverage_maksimal: 1.0 # 1x (tanpa leverage untuk saat ini)
-  threshold_likuidasi: 0.9
+  hitung_obv: true
+  obv_roc_period: 10 # Period untuk OBV Rate of Change
 
+  hitung_ad: true
+  hitung_adosc: true
+
+  adosc:
+    cepat: 3
+    lambat: 10
+
+  # ===========================================================================
+  # TREND INDICATORS
+  # ===========================================================================
+  adx_period: 14
+  aroon_period: 14
+
+  sar:
+    acceleration: 0.02
+    maximum: 0.2
+
+  hitung_ichimoku: true
+
+  ichimoku:
+    tenkan: 9
+    kijun: 26
+    senkou_b: 52
+
+  # ===========================================================================
+  # PRICE FEATURES
+  # ===========================================================================
+  price_change_periods: [1, 4, 12, 24, 48, 96]
+  hitung_candle_patterns: true
+  hitung_price_position: true
+
+  # ===========================================================================
+  # DERIVED FEATURES (Fitur Turunan)
+  # ===========================================================================
+
+  # MA Crossovers
+  hitung_ma_crossovers: true
+  ma_crossovers:
+    golden_death: # Golden Cross / Death Cross
+      cepat: 50 # SMA fast period
+      lambat: 200 # SMA slow period
+    ema_cross: # EMA crossover
+      cepat: 9
+      lambat: 21
+
+  # MA Slopes
+  hitung_ma_slopes: true
+  ma_slope_base: 21 # SMA yang digunakan untuk slope calculation
+  slope_periods: [5, 10, 20] # Lookback periods untuk slope
+
+  # Price vs MA
+  hitung_price_vs_ma: true
+  price_vs_ma_periods: [7, 21, 50, 200]
+
+  # RSI Zones
+  rsi_zone_period: 14 # RSI period untuk zone detection
+  rsi_overbought: 70 # Threshold overbought
+  rsi_oversold: 30 # Threshold oversold
+
+  # Volatility Regime
+  volatility_atr_period: 14 # ATR period untuk volatility regime
+  volatility_ma_period: 50 # MA period untuk smoothing ATR
+  volatility_high_mult: 1.5 # Multiplier untuk high volatility threshold
+  volatility_low_mult: 0.5 # Multiplier untuk low volatility threshold
+
+# -----------------------------------------------------------------------------
+# DQN AGENT SETTINGS (untuk fase berikutnya)
+# -----------------------------------------------------------------------------
 agen:
-  # Parameter DQN
+  # Neural network
+  hidden_layers: [256, 128, 64]
   learning_rate: 0.0001
-  gamma: 0.99
-  epsilon_awal: 1.0
-  epsilon_akhir: 0.01
-  epsilon_decay: 0.9995
+  gamma: 0.99 # Discount factor
 
-  # Memori
-  ukuran_replay_buffer: 100000
-  ukuran_batch: 32
+  # Replay buffer
+  buffer_size: 100000
+  batch_size: 64
 
-  # Network
-  hidden_layers: [512, 256, 128]
+  # Exploration
+  epsilon_start: 1.0
+  epsilon_end: 0.01
+  epsilon_decay: 0.995
 
-  # Pelatihan
-  frekuensi_update_target: 1000
-  frekuensi_simpan: 10000
+  # Training
+  target_update_freq: 100 # Steps between target network updates
+
+# -----------------------------------------------------------------------------
+# TRADING ENVIRONMENT SETTINGS (untuk fase berikutnya)
+# -----------------------------------------------------------------------------
+lingkungan:
+  saldo_awal: 10000 # USD
+  maks_posisi: 3 # Maksimal 3 posisi bersamaan
+  biaya_trading: 0.0004 # 0.04% (Binance futures maker fee)
+  leverage: 1 # Leverage (1 = no leverage)
+
+  # Reward shaping
+  reward_type: "pnl" # pnl, sharpe, sortino
+  reward_scaling: 100 # Scale rewards

@@ -8,7 +8,7 @@ Sumber data: https://data.binance.vision/
 import os
 import requests
 import zipfile
-import pandas as pd
+import polars as pl
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -64,7 +64,7 @@ class PengunduhDataHistoris:
 
     def _unduh_potongan(
         self, simbol: str, interval: str, string_tanggal: str, tipe_data: str
-    ) -> Optional[pd.DataFrame]:
+    ) -> Optional[pl.DataFrame]:
         """Mengunduh satu potongan (daily atau monthly)."""
 
         # Buat URL
@@ -91,7 +91,21 @@ class PengunduhDataHistoris:
 
         # Baca CSV
         path_csv = self.direktori_output / nama_csv
-        df = pd.read_csv(path_csv, header=None)
+        df = pl.read_csv(path_csv, has_header=False,
+                        new_columns=[
+                            "waktu_buka",
+                            "buka",
+                            "tinggi",
+                            "rendah",
+                            "tutup",
+                            "volume",
+                            "waktu_tutup",
+                            "quote_volume",
+                            "jumlah_trade",
+                            "taker_buy_base",
+                            "taker_buy_quote",
+                            "ignore",
+                        ])
 
         # Bersihkan
         zip_sementara.unlink()
@@ -103,30 +117,16 @@ class PengunduhDataHistoris:
         # 9: Taker buy base volume, 10: Taker buy quote volume, 11: Ignore
 
         # Periksa apakah baris pertama adalah header (beberapa file Binance punya header)
-        if df.iloc[0, 0] == "open_time" or not str(df.iloc[0, 0]).isdigit():
+        first_val = df.select(pl.col("waktu_buka").first()).item()
+        if first_val == "open_time" or not str(first_val).isdigit():
             # Buang baris header
-            df = df.iloc[1:].reset_index(drop=True)
+            df = df.slice(1)
 
-        df.columns = [
-            "waktu_buka",
-            "buka",
-            "tinggi",
-            "rendah",
-            "tutup",
-            "volume",
-            "waktu_tutup",
-            "quote_volume",
-            "jumlah_trade",
-            "taker_buy_base",
-            "taker_buy_quote",
-            "ignore",
-        ]
-
-        # Konversi timestamp ke numerik dulu, baru ke datetime
-        df["waktu_buka"] = pd.to_numeric(df["waktu_buka"], errors="coerce")
-        df["waktu_tutup"] = pd.to_numeric(df["waktu_tutup"], errors="coerce")
-        df["waktu_buka"] = pd.to_datetime(df["waktu_buka"], unit="ms", errors="coerce")
-        df["waktu_tutup"] = pd.to_datetime(df["waktu_tutup"], unit="ms", errors="coerce")
+        # Konversi timestamp ke datetime
+        df = df.with_columns([
+            pl.col("waktu_buka").cast(pl.Int64, strict=False).cast(pl.Datetime("ms")),
+            pl.col("waktu_tutup").cast(pl.Int64, strict=False).cast(pl.Datetime("ms")),
+        ])
 
         # Konversi ke tipe numerik
         kolom_numerik = [
@@ -139,24 +139,21 @@ class PengunduhDataHistoris:
             "taker_buy_base",
             "taker_buy_quote",
         ]
-        for kolom in kolom_numerik:
-            df[kolom] = pd.to_numeric(df[kolom], errors="coerce")
+        df = df.with_columns([pl.col(kolom).cast(pl.Float64, strict=False) for kolom in kolom_numerik])
 
         # Konversi jumlah_trade ke integer
-        df["jumlah_trade"] = pd.to_numeric(df["jumlah_trade"], errors="coerce").astype("Int64")
+        df = df.with_columns(pl.col("jumlah_trade").cast(pl.Int64, strict=False))
 
         # Buang kolom yang tidak perlu
-        df = df[
-            [
-                "waktu_buka",
-                "buka",
-                "tinggi",
-                "rendah",
-                "tutup",
-                "volume",
-                "jumlah_trade",
-            ]
-        ]
+        df = df.select([
+            "waktu_buka",
+            "buka",
+            "tinggi",
+            "rendah",
+            "tutup",
+            "volume",
+            "jumlah_trade",
+        ])
 
         return df
 
@@ -209,13 +206,13 @@ class PengunduhDataHistoris:
             return
 
         # Gabungkan semua potongan
-        df_gabungan = pd.concat(semua_data, ignore_index=True)
-        df_gabungan = df_gabungan.drop_duplicates(subset=["waktu_buka"])
-        df_gabungan = df_gabungan.sort_values("waktu_buka").reset_index(drop=True)
+        df_gabungan = pl.concat(semua_data)
+        df_gabungan = df_gabungan.unique(subset=["waktu_buka"], maintain_order=True)
+        df_gabungan = df_gabungan.sort("waktu_buka")
 
         # Simpan sebagai parquet (jauh lebih efisien dari CSV)
         file_output = direktori_simbol / f"{interval}.parquet"
-        df_gabungan.to_parquet(file_output, index=False)
+        df_gabungan.write_parquet(file_output)
 
         logger.info(f"Tersimpan {len(df_gabungan)} candle ke {file_output}")
         logger.info(
