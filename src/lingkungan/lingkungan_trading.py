@@ -386,7 +386,7 @@ class LingkunganTrading:
         Returns:
             observasi_awal: State vector untuk timestamp pertama
         """
-        # Titil mulai acak (hindari terlalu dekat dengan akhir data)
+        # Titik mulai acak (hindari terlalu dekat dengan akhir data)
         if indeks_mulai is None:
             max_start = len(self.data) - self.panjang_episode_max - 1
             self.indeks_saat_ini = np.random.randint(0, max(1, max_start))
@@ -608,7 +608,7 @@ def test_environment():
     for langkah in range(100):
         # Aksi acak
         aksi = np.random.randint(0, env.dim_aksi)
-        observasi, hasil, selesai, info = env.langkah(aksi)
+        observasi, hasil, selesai = env.langkah(aksi)
         total_hasil += hasil
 
         if langkah % 20 == 0:
