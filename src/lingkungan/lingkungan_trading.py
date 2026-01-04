@@ -531,7 +531,7 @@ def muat_data_untuk_training(
     path_fitur: str,
     simbol: str = "BTCUSDT",
     timeframe: str = "15m",
-    rasio_train: float = 0.6,
+    rasio_pelatihan: float = 0.6,
     rasio_validasi: float = 0.2,
 ) -> Tuple[pl.DataFrame, pl.DataFrame, pl.DataFrame]:
     """
@@ -541,7 +541,7 @@ def muat_data_untuk_training(
         path_fitur: Path ke direktori data fitur
         simbol: Simbol pasangan crypto
         timeframe: Timeframe data
-        rasio_train: Rasio data untuk training
+        rasio_pelatihan: Rasio data untuk training
         rasio_validasi: Rasio data untuk validation
 
     Returns:
@@ -561,18 +561,18 @@ def muat_data_untuk_training(
 
     # Split data
     n = len(df)
-    train_akhir = int(n * rasio_train)
-    validation_akhir = int(n * (rasio_train + rasio_validasi))
+    train_akhir = int(n * rasio_pelatihan)
+    validation_akhir = int(n * (rasio_pelatihan + rasio_validasi))
 
     df_train = df.slice(0, train_akhir)
     df_val = df.slice(train_akhir, validation_akhir - train_akhir)
     df_test = df.slice(validation_akhir, n - validation_akhir)
 
     logger.info(f"Data split untuk {simbol}:")
-    logger.info(f"  Train:  {len(df_train)} baris ({rasio_train*100:.0f}%)")
-    logger.info(f"  Val:    {len(df_val)} baris ({rasio_validasi*100:.0f}%)")
+    logger.info(f"  Pelatihan:  {len(df_train)} baris ({rasio_pelatihan*100:.0f}%)")
+    logger.info(f"  Validasi:   {len(df_val)} baris ({rasio_validasi*100:.0f}%)")
     logger.info(
-        f"  Test:   {len(df_test)} baris ({(1-rasio_train-rasio_validasi)*100:.0f}%)"
+        f"  Tes:    {len(df_test)} baris ({(1-rasio_pelatihan-rasio_validasi)*100:.0f}%)"
     )
 
     return df_train, df_val, df_test
@@ -598,7 +598,7 @@ def test_environment():
         panjang_episode_max=100,  # Episode singkat untuk percobaan
     )
 
-    # Jalankan episdoe acak
+    # Jalankan episode acak
     observasi = env.reset()
     print(f"\nBentuk observasi: {observasi.shape}")
     print(f"Dim observasi: {env.dim_observasi}")
