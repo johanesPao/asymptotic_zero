@@ -8,7 +8,7 @@ Menggunakan numpy arryas untuk efisiensi memori dan kecepatan.
 """
 
 import numpy as np
-from typing import Tuple, List
+from typing import Tuple
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -40,7 +40,7 @@ class BufferPengalaman:
         self.next_states = np.zeros((kapasitas_max, dim_state), dtype=np.float32)
         self.selesai = np.zeros(kapasitas_max, dtype=np.bool)
 
-        logger.info(f"BufferPengalaman di-inisialisasi:")
+        logger.info("BufferPengalaman di-inisialisasi:")
         logger.info(f"  - Kapasitas: {kapasitas_max}")
         logger.info(f"  - State dim: {dim_state}")
         logger.info(f"  - Memory: ~{self._estimasi_memori():.2f} MB")
@@ -210,7 +210,7 @@ def test_buffer():
     print(f"Buffer penuh: {buffer.penuh}")
 
     stats = buffer.dapatkan_statistik()
-    print(f"\nStatistik buffer:")
+    print("\nStatistik buffer:")
     for kunci, nilai in stats.items():
         if isinstance(nilai, float) and kunci != "penggunaan_persen":
             print(f"    {kunci}: {nilai:.4f}")
@@ -250,10 +250,10 @@ def test_buffer():
 
     print(f"Buffer size setelah 1100 penyimpanan: {len(buffer)}")
     print(f"Buffer penuh: {buffer.penuh}")
-    print(f"Expected: 1000 (circular overwrite)")
+    print("Expected: 1000 (circular overwrite)")
 
     stats = buffer.dapatkan_statistik()
-    print(f"\nStatistik buffer final:")
+    print("\nStatistik buffer final:")
     for kunci, nilai in stats.items():
         if isinstance(nilai, float) and kunci != "penggunaan_persen":
             print(f"    {kunci}: {nilai:.4f}")
