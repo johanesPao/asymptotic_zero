@@ -198,16 +198,16 @@ agen:
   gamma: 0.99 # Discount factor
 
   # Replay buffer
-  buffer_size: 100000
-  batch_size: 64
+  ukuran_buffer: 100000
+  ukuran_batch: 64
 
   # Exploration
-  epsilon_start: 1.0
-  epsilon_end: 0.01
+  epsilon_mulai: 1.0
+  epsilon_akhir: 0.01
   epsilon_decay: 0.995
 
   # Training
-  target_update_freq: 100 # Steps between target network updates
+  frekuensi_upd_target: 100 # Steps between target network updates
 
 # -----------------------------------------------------------------------------
 # TRADING ENVIRONMENT SETTINGS (untuk fase berikutnya)
