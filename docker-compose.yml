@@ -1,0 +1,27 @@
+services:
+  asymptotic_zero:
+    image: ghcr.io/johanespao/asymptotic_zero:latest
+    container_name: asymptotic_zero
+
+    # Restart automatically unless manually stopped (survives VPS reboots).
+    # Orderly daily restarts at 07:00 WIB are handled by the at-job scheduler
+    # written by GitHub Actions on every deploy.
+    restart: unless-stopped
+
+    # All runtime secrets come from the .env file written by GitHub Actions
+    env_file:
+      - .env
+
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TF_CPP_MIN_LOG_LEVEL=2
+      - TF_ENABLE_ONEDNN_OPTS=0
+
+    # Persist log files on VPS between container restarts / image updates
+    volumes:
+      - ./logs:/app/logs
+
+    # No TTY — keyboard scroll disabled in headless mode.
+    # live_dashboard.py handles this gracefully (try/except in keyboard listener).
+    stdin_open: false
+    tty: false

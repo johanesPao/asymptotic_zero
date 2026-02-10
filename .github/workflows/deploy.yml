@@ -1,0 +1,181 @@
+name: Build, Push & Deploy
+
+# ── Trigger ────────────────────────────────────────────────────────────────────
+# Runs on every push to main (your normal git push workflow)
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: johanespao/asymptotic_zero
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 1 — Build the Docker image on GitHub's servers and push to ghcr.io
+# ══════════════════════════════════════════════════════════════════════════════
+jobs:
+  build-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+
+    # These permissions allow the runner to push to ghcr.io using GITHUB_TOKEN.
+    # No personal token needed for the push — only for the VPS pull (ASYMPTOTIC_GHCR_TOKEN).
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Log in to GitHub Container Registry using the built-in runner token.
+      # GITHUB_TOKEN is automatically available — no secret needed for this step.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Generates two tags:
+      #   ghcr.io/johanespao/asymptotic_zero:latest   ← always overwritten on main
+      #   ghcr.io/johanespao/asymptotic_zero:sha-<7>  ← immutable per commit
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=short,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      # Buildx enables layer caching — subsequent builds after the first are much faster
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # The actual build. .dockerignore handles what is excluded (data/, az_env/, etc.)
+      # checkpoints/best is included because it is committed to git.
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Cache build layers in GitHub Actions cache — saves ~5 min on repeated builds
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# JOB 2 — Deploy: copy compose file, write secrets, schedule restart on VPS
+# ══════════════════════════════════════════════════════════════════════════════
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    needs: build-push   # only runs after image push succeeds
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Step 1: Copy docker-compose.yml to VPS ──────────────────────────────
+      # Uses SCP so VPS does NOT need git credentials or a cloned repo.
+      # Only docker-compose.yml needs to be on VPS — everything else is in the image.
+      - name: Copy docker-compose.yml to VPS
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SERVER_URL }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          source: "docker-compose.yml"
+          target: "${{ secrets.SERVER_ASYMPTOTIC_PATH }}"
+
+      # ── Step 2: SSH — write .env, write restart script, schedule/start ──────
+      - name: Write secrets and schedule restart
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_URL }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          # All ${{ secrets.* }} are expanded by GitHub Actions BEFORE the script
+          # is sent over SSH — secrets never travel as environment variables.
+          script: |
+            set -e
+            AZ_PATH="${{ secrets.SERVER_ASYMPTOTIC_PATH }}"
+
+            # ── a) Create logs dir if it doesn't exist yet ─────────────────────
+            mkdir -p "${AZ_PATH}/logs"
+
+            # ── b) Write .env ──────────────────────────────────────────────────
+            # Each secret is written as a separate echo to handle any special
+            # characters in values safely (avoids heredoc quoting issues).
+            {
+              echo "SECRET_HOST=${{ secrets.SECRET_HOST }}"
+              echo "PROJECT_ID=${{ secrets.PROJECT_ID }}"
+              echo "CLIENT_ID=${{ secrets.CLIENT_ID }}"
+              echo "CLIENT_SECRET=${{ secrets.CLIENT_SECRET }}"
+              echo "ASYMPTOTIC_MODE=${{ secrets.ASYMPTOTIC_MODE }}"
+              echo "ASYMPTOTIC_GHCR_TOKEN=${{ secrets.ASYMPTOTIC_GHCR_TOKEN }}"
+            } > "${AZ_PATH}/.env"
+            chmod 600 "${AZ_PATH}/.env"
+            echo "✅ .env written ($(wc -l < "${AZ_PATH}/.env") vars)"
+
+            # ── c) Write the restart script ────────────────────────────────────
+            # Strategy: write script with __AZ_PATH__ placeholder (single-quoted
+            # heredoc = no expansion inside), then sed-replace the placeholder.
+            # This avoids all heredoc-vs-shell-expansion conflicts.
+            cat > "${AZ_PATH}/az_restart.sh" << 'END_SCRIPT'
+            #!/bin/bash
+            set -e
+            AZ_PATH="__AZ_PATH__"
+
+            # Read ghcr pull token from .env (already written by GitHub Actions)
+            GHCR_TOKEN=$(grep '^ASYMPTOTIC_GHCR_TOKEN=' "${AZ_PATH}/.env" | cut -d '=' -f2-)
+
+            # Authenticate against ghcr.io
+            echo "${GHCR_TOKEN}" | docker login ghcr.io -u johanesPao --password-stdin
+
+            # Pull latest image and restart container
+            cd "${AZ_PATH}"
+            docker compose pull
+            docker compose up -d
+
+            echo "$(date '+%Y-%m-%d %H:%M:%S') — Asymptotic Zero restarted by at-scheduler" \
+              >> "${AZ_PATH}/logs/restart.log"
+            END_SCRIPT
+
+            # Replace __AZ_PATH__ placeholder with the real path
+            sed -i "s|__AZ_PATH__|${AZ_PATH}|g" "${AZ_PATH}/az_restart.sh"
+            chmod +x "${AZ_PATH}/az_restart.sh"
+            echo "✅ az_restart.sh written"
+
+            # ── d) Login to ghcr.io on VPS (needed for immediate start or pull) ─
+            GHCR_TOKEN=$(grep '^ASYMPTOTIC_GHCR_TOKEN=' "${AZ_PATH}/.env" | cut -d '=' -f2-)
+            echo "${GHCR_TOKEN}" | docker login ghcr.io -u johanesPao --password-stdin
+            echo "✅ ghcr.io login OK"
+
+            # ── e) Decide: schedule restart OR start immediately ───────────────
+            if docker ps --format '{{.Names}}' | grep -q '^asymptotic_zero$'; then
+              echo "📦 Container is currently running."
+              echo "   Scheduling restart at 07:00 WIB (00:00 UTC) so today's session finishes cleanly."
+
+              # Cancel any previously scheduled restarts to avoid duplicate jobs
+              # (safe: this user's at queue will only ever contain az restart jobs)
+              atq | awk '{print $1}' | xargs -r atrm 2>/dev/null || true
+
+              # Schedule one-time execution at 00:00 UTC = 07:00 WIB
+              # 'at 00:00' always picks the NEXT occurrence, even if it's already
+              # past midnight UTC right now.
+              echo "${AZ_PATH}/az_restart.sh >> ${AZ_PATH}/logs/restart.log 2>&1" | at 00:00
+
+              echo "✅ Restart scheduled. Pending at queue:"
+              atq
+            else
+              echo "📦 Container is NOT running — pulling and starting immediately."
+              cd "${AZ_PATH}"
+              docker compose pull
+              docker compose up -d
+              echo "✅ Container started."
+              docker ps --filter "name=asymptotic_zero" --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"
+            fi

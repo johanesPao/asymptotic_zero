@@ -1,0 +1,62 @@
+# ── Virtual environment ───────────────────────────────────────────────────────
+az_env/
+
+# ── Python bytecode ───────────────────────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+
+# ── Secrets (injected at runtime via .env on VPS) ────────────────────────────
+.env
+
+# ── Training data (bot fetches live from Binance at runtime) ─────────────────
+data/
+
+# ── Logs (runtime output, not needed in image) ───────────────────────────────
+logs/
+
+# ── Checkpoints — include ONLY best, exclude everything else ─────────────────
+checkpoints/*
+!checkpoints/best
+!checkpoints/best/**
+
+# ── Training / evaluation / analysis scripts (not needed at runtime) ─────────
+scripts/train.py
+scripts/holdout_eval.py
+scripts/evaluate.py
+scripts/comprehensive_eval.py
+scripts/paper_trade.py
+scripts/precalculate_indicators.py
+scripts/analyze_correlation.py
+scripts/monitor.py
+scripts/live_trading_bot.py
+run_pipeline.py
+
+# ── Test scripts ──────────────────────────────────────────────────────────────
+scripts/test_*.py
+scripts/verify_*.py
+scripts/create_tables.py
+
+# ── Result snapshots (analysis artefacts) ────────────────────────────────────
+holdout_results.json
+model_evaluation_results.json
+paper_trading_results.json
+paper_trading_live_results.json
+live_performance.json
+
+# ── IDE / editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── OS / git ──────────────────────────────────────────────────────────────────
+.git/
+.gitignore
+.DS_Store
+Thumbs.db
+
+# ── Old deployment folder ─────────────────────────────────────────────────────
+deployment/
+
+# ── Docs ──────────────────────────────────────────────────────────────────────
+*.md
