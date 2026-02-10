@@ -1,18 +1,18 @@
 # ─── Stage 1: Build TA-Lib C library ───────────────────────────────────────
 FROM python:3.13-slim AS talib-builder
 
-# Install all required build dependencies
+# Install build tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        gcc g++ make wget ca-certificates autoconf libtool pkg-config bison flex \
+        gcc g++ make wget ca-certificates autoconf libtool pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-# Download and compile TA-Lib C library
+# Download and build TA-Lib C library
 RUN wget -O ta-lib.tar.gz \
         https://downloads.sourceforge.net/project/ta-lib/ta-lib/0.4.0/ta-lib-0.4.0-src.tar.gz \
     && tar -xzf ta-lib.tar.gz \
     && cd ta-lib \
     && ./configure --prefix=/usr \
-    && make -j$(nproc) \
+    && make  \   # <- remove -j$(nproc)
     && make install \
     && cd / \
     && rm -rf ta-lib ta-lib.tar.gz
