@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN wget -O ta-lib.tar.gz \
         https://downloads.sourceforge.net/project/ta-lib/ta-lib/0.4.0/ta-lib-0.4.0-src.tar.gz \
     && tar -xzf ta-lib.tar.gz \
-    && cd ta-lib-* \
+    && cd ta-lib \
     && ./configure --prefix=/usr \
     && make -j$(nproc) \
     && make install \
