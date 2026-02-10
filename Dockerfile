@@ -12,7 +12,7 @@ RUN wget -O ta-lib.tar.gz \
     && tar -xzf ta-lib.tar.gz \
     && cd ta-lib \
     && ./configure --prefix=/usr \
-    && make  \   # <- remove -j$(nproc)
+    && make  \
     && make install \
     && cd / \
     && rm -rf ta-lib ta-lib.tar.gz
