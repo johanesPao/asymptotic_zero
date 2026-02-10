@@ -5,15 +5,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc g++ make wget ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Download and compile TA-Lib C library (required by TA-Lib Python wrapper)
-RUN wget -q https://sourceforge.net/projects/ta-lib/files/ta-lib/0.4.0/ta-lib-0.4.0-src.tar.gz \
-    && tar -xzf ta-lib-0.4.0-src.tar.gz \
-    && cd ta-lib \
+# Download and compile TA-Lib C library
+RUN wget -O ta-lib.tar.gz \
+        https://downloads.sourceforge.net/project/ta-lib/ta-lib/0.4.0/ta-lib-0.4.0-src.tar.gz \
+    && tar -xzf ta-lib.tar.gz \
+    && cd ta-lib-0.4.0 \
     && ./configure --prefix=/usr \
     && make -j$(nproc) \
     && make install \
-    && cd .. \
-    && rm -rf ta-lib ta-lib-0.4.0-src.tar.gz
+    && cd / \
+    && rm -rf ta-lib-0.4.0 ta-lib.tar.gz
 
 
 # ─── Stage 2: Python dependencies ──────────────────────────────────────────
@@ -51,7 +52,7 @@ WORKDIR /app
 # Copy project source — .dockerignore handles exclusions
 COPY . .
 
-# Ensure checkpoints/best exists (model must be committed to git)
+# Ensure checkpoints/best exists
 RUN test -d checkpoints/best || (echo "ERROR: checkpoints/best not found. Commit the trained model first." && exit 1)
 
 # Non-root user for security
