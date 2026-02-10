@@ -2,7 +2,7 @@
 FROM python:3.13-slim AS talib-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        gcc g++ make wget ca-certificates \
+        gcc g++ make wget ca-certificates autoconf libtool pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
 RUN wget -O ta-lib.tar.gz \
