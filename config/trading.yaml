@@ -1,0 +1,89 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRADING ENVIRONMENT CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ───────────────────────────────────────────────────────────────────────────────
+# PORTFOLIO SETTINGS
+# ───────────────────────────────────────────────────────────────────────────────
+portfolio:
+  initial_balance: 10000.0 # Starting balance in USDT
+  max_positions: 3 # Maximum concurrent position
+  position_size_pct: 0.20 # Each position = 20% of portfolio
+  leverage: 10 # Leverage multiplier (1 = no leverage)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# TRADING COSTS
+# ───────────────────────────────────────────────────────────────────────────────
+costs:
+  maker_fee_pct: 0.02 # 0.02% maker fee (limit orders)
+  taker_fee_pct: 0.04 # 0.04% taker fee (market orders)
+  slippage_pct: 0.01 # 0.01% estimated slippage
+  use_taker_fees: true # Assume market orders (taker fees)
+
+# ───────────────────────────────────────────────────────────────────────────────
+# ACTION SPACE
+# ───────────────────────────────────────────────────────────────────────────────
+actions:
+  num_coins_per_side: 10 # 10 gainers + 10 losers
+  enable_reverse: false # Disable reverse actions (simplify)
+  enable_close_all: true # Enable close all positions
+  enable_close_worst: true # Enable close worst position
+
+  # Action mapping:
+  # 0: HOLD
+  # 1-10: LONG gainer[0-9]
+  # 11-20: SHORT gainer[0-9]
+  # 21-30: CLOSE gainer[0-9]
+  # 31-40: LONG loser[0-9]
+  # 41-50: SHORT loser[0-9]
+  # 51-60: CLOSE loser[0-9]
+  # 61: CLOSE_ALL
+  # 62: CLOSE_WORST
+
+# ───────────────────────────────────────────────────────────────────────────────
+# EPISODE SETTINGS
+# ───────────────────────────────────────────────────────────────────────────────
+episode:
+  candles_per_day: 288 # 5-minute candles per day
+  warmup_candles: 200 # Skip first N candles (indicator warmup)
+  force_close_at_end: true # Close all positions at end of day
+
+# ───────────────────────────────────────────────────────────────────────────────
+# REWARD SETTINGS
+# ───────────────────────────────────────────────────────────────────────────────
+reward:
+  type: "pnl_aligned" # Options: "pnl", "sharpe", "sortino", "calmar"
+  pnl_scale: 100.0
+
+  # PnL-based reward
+  pnl:
+    scale: 100.0 # Multiply PnL by this factor
+    clip_min: -10.0 # Clip minimum reward
+    clip_max: 10.0 # Clip maximum reward
+
+  # Penalties
+  penalties:
+    invalid_action: -0.01 # Penalty for invalid actions
+    excessive_trading: -0.01 # Penalty per trade (discourage overtrading)
+    holding_losing: -0.001 # Small penalty per step holding losing position
+
+  # Bonuses
+  bonuses:
+    profitable_close: 0.5 # Bonus for closing profitable position
+    winning_streak: 0.1 # Bonus per consecutive win
+
+# ───────────────────────────────────────────────────────────────────────────────
+# STATE NORMALIZATION
+# ───────────────────────────────────────────────────────────────────────────────
+normalization:
+  method: "zscore" # Options: "zscore", "minmax", "robust"
+  clip_outliers: true # Clip extreme values
+  clip_std: 3.0 # Clip at +- 3 standard deviations
+
+# ───────────────────────────────────────────────────────────────────────────────
+# DATA PATHS
+# ───────────────────────────────────────────────────────────────────────────────
+data:
+  five_minute_dir: "data/volatility/5m"
+  top_movers_file: "data/volatility/top_movers.parquet"
+  features_config: "config/features.yaml"

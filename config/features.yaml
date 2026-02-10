@@ -1,0 +1,304 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# TECHNICAL INDICATORS CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# This file defines all technical indicators calculated from 5-minute OHLCV data.
+# The "kitchen sink" approach: include many periods, let the neural network
+# discover which combinations matter for different market conditions.
+#
+# Total features: ~205
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# TREND INDICATORS (~50 features)
+# ─────────────────────────────────────────────────────────────────────────────────
+trend:
+  # Simple Moving Average
+  sma:
+    periods: [5, 7, 10, 14, 20, 25, 30, 50, 100, 200]
+
+  # Exponential Moving Average
+  ema:
+    periods: [5, 7, 10, 14, 20, 25, 30, 50, 100, 200]
+
+  # Weighted Moving Average
+  wma:
+    periods: [7, 14, 21, 50]
+
+  # Double Exponential Moving Average
+  dema:
+    periods: [7, 14, 21]
+
+  # Triple Exponential Moving Average
+  tema:
+    periods: [7, 14, 21]
+
+  # Kaufman Adaptive Moving Average
+  kama:
+    periods: [7, 14, 21]
+
+  # T3 Moving Average
+  t3:
+    periods: [7, 14]
+    vfactor: 0.7
+
+  # MACD (Moving Average Convergence Divergence)
+  macd:
+    fast_period: 12
+    slow_period: 26
+    signal_period: 9
+    # Outputs: macd_line, macd_signal, macd_histogram
+
+  # Average Directional Index
+  adx:
+    periods: [7, 14, 21]
+
+  # Plus/Minus Directional Index
+  di:
+    periods: [7, 14, 21]
+    # Outputs: plus_di_{period}, minus_di_{period}
+
+  # Aroon Indicator
+  aroon:
+    periods: [14, 25]
+    # Outputs: aroon_up_{period}, aroon_down_{period}, aroon_osc_{period}
+
+  # Parabolic SAR
+  sar:
+    acceleration: 0.02
+    maximum: 0.2
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# MOMENTUM INDICATORS (~40 features)
+# ─────────────────────────────────────────────────────────────────────────────────
+momentum:
+  # Relative Strength Index
+  rsi:
+    periods: [5, 7, 9, 14, 21, 28]
+
+  # Stochastic Oscillator
+  stochastic:
+    periods: [5, 9, 14]
+    k_smooth: 3
+    d_smooth: 3
+    # Outputs: stoch_k_{period}, stoch_d_{period}
+
+  # Stochastic RSI
+  stochastic_rsi:
+    period: 14
+    k_smooth: 3
+    d_smooth: 3
+    # Outputs: stochrsi_k, stochrsi_d
+
+  # Commodity Channel Index
+  cci:
+    periods: [7, 14, 20]
+
+  # Williams %R
+  willr:
+    periods: [7, 14, 21]
+
+  # Money Flow Index
+  mfi:
+    periods: [7, 14, 21]
+
+  # Rate of Change
+  roc:
+    periods: [5, 10, 20]
+
+  # Momentum
+  mom:
+    periods: [5, 10, 20]
+
+  # Triple Exponential Average (TRIX)
+  trix:
+    periods: [7, 14]
+
+  # Ultimate Oscillator
+  ultosc:
+    period1: 7
+    period2: 14
+    period3: 28
+
+  # Chande Momentum Oscillator
+  cmo:
+    periods: [7, 14]
+
+  # Percentage Price Oscillator
+  ppo:
+    fast_period: 12
+    slow_period: 26
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# VOLATILITY INDICATORS (~35 features)
+# ─────────────────────────────────────────────────────────────────────────────────
+volatility:
+  # Bollinger Bands
+  bbands:
+    periods: [10, 20, 30]
+    std_dev: 2.0
+    # Outputs per period: bb_upper, bb_middle, bb_lower, bb_pctb, bb_width
+
+  # Average True Range
+  atr:
+    periods: [7, 14, 21]
+
+  # Normalized Average True Range
+  natr:
+    periods: [7, 14]
+
+  # True Range (single value)
+  trange:
+    enabled: true
+
+  # Keltner Channels
+  keltner:
+    period: 20
+    atr_period: 10
+    multiplier: 2.0
+    # Outputs: kc_upper, kc_middle, kc_lower
+
+  # Donchian Channels
+  donchian:
+    period: 20
+    # Outputs: dc_upper, dc_middle, dc_lower
+
+  # Standard Deviation
+  stddev:
+    periods: [7, 14, 20]
+
+  # Variance
+  variance:
+    periods: [7, 14]
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# VOLUME INDICATORS (~20 features)
+# ─────────────────────────────────────────────────────────────────────────────────
+volume:
+  # On-Balance Volume
+  obv:
+    enabled: true
+
+  # Accumulation/Distribution Line
+  ad:
+    enabled: true
+
+  # Accumulation/Distribution Oscillator
+  adosc:
+    fast_period: 3
+    slow_period: 10
+
+  # Volume Simple Moving Average
+  volume_sma:
+    periods: [7, 14, 20]
+
+  # Volume Exponential Moving Average
+  volume_ema:
+    periods: [7, 14, 20]
+
+  # Volume Ratio (current / average)
+  volume_ratio:
+    period: 20
+
+  # Volume Weighted Average Price
+  vwap:
+    enabled: true
+
+  # Chaikin Money Flow
+  cmf:
+    periods: [7, 14, 20]
+
+  # Ease of Movement
+  emv:
+    period: 14
+
+  # Force Index
+  force:
+    periods: [7, 14]
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# PRICE FEATURES (~25 features)
+# ─────────────────────────────────────────────────────────────────────────────────
+price:
+  # Simple Returns (percentage change)
+  returns:
+    periods: [1, 2, 3, 5, 10, 15, 20, 30, 50]
+
+  # Log Returns
+  log_returns:
+    periods: [1, 5, 10, 20]
+
+  # High-Low Range
+  hl_range:
+    enabled: true
+    # Outputs: hl_range, hl_range_pct
+
+  # Close Position in Range (0 = at low, 1 = at high)
+  close_position:
+    enabled: true
+
+  # Gap (open vs previous close)
+  gap:
+    enabled: true
+
+  # Candle Components
+  candle:
+    enabled: true
+    # Outputs: body_size, upper_shadow, lower_shadow, body_ratio
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# CROSS/RATIO FEATURES (~25 features)
+# ─────────────────────────────────────────────────────────────────────────────────
+cross:
+  # Price / SMA Ratio
+  price_sma_ratio:
+    periods: [7, 14, 20, 50, 100, 200]
+
+  # Price / EMA Ratio
+  price_ema_ratio:
+    periods: [7, 14, 20, 50]
+
+  # SMA Crossover Distance (fast - slow)
+  sma_cross:
+    pairs:
+      - [7, 20]
+      - [20, 50]
+      - [50, 200]
+
+  # EMA Crossover Distance
+  ema_cross:
+    pairs:
+      - [7, 20]
+      - [20, 50]
+
+  # RSI Distance from 50
+  rsi_distance:
+    period: 14
+
+  # Price Distance from Bollinger Bands
+  bb_distance:
+    period: 20
+    # Outputs: bb_dist_upper, bb_dist_lower
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# PATTERN FEATURES (~10 features)
+# ─────────────────────────────────────────────────────────────────────────────────
+pattern:
+  # Moving Average Trend Direction (-1, 0, 1)
+  ma_trend:
+    periods: [7, 14, 20]
+    lookback: 3
+
+  # Higher Highs / Lower Lows Count
+  hl_count:
+    lookback: 5
+    # Outputs: higher_highs, lower_lows
+
+  # Consecutive Up/Down Candles
+  consecutive:
+    enabled: true
+
+  # Volatility Regime (ATR percentile)
+  volatility_regime:
+    atr_period: 14
+    lookback: 100

@@ -1,0 +1,67 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# DQN AGENT CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# NETWORK ARCHITECTURE
+# ─────────────────────────────────────────────────────────────────────────────────
+network:
+  hidden_layers: [512, 256, 128] # Hidden layer sizes
+  activation: "relu" # Activation function
+  dropout_rate: 0.2 # Dropout for regularization
+  use_batch_norm: false # Batch normalization
+  use_dueling: false # Dueling DQN architecture (future)
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# LEARNING PARAMETERS
+# ─────────────────────────────────────────────────────────────────────────────────
+learning:
+  learning_rate: 0.00005 # Adam learning rate (reduced for stability with large state)
+  gamma: 0.99 # Discount factor
+  batch_size: 128 # Training batch size (increased for more stable gradients)
+  target_update_freq: 1000 # Steps between target network updates
+  gradient_clip: 1.0 # Gradient clipping (max norm)
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# EXPLORATION
+# ─────────────────────────────────────────────────────────────────────────────────
+exploration:
+  epsilon_start: 1.0 # Initial exploration rate
+  epsilon_end: 0.05 # Final exploration rate (increased from 0.01 for crypto volatility)
+  epsilon_decay_steps: 20000 # Steps to decay from start to end (faster decay)
+  exploration_type: "linear" # "linear" or "exponential"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# REPLAY BUFFER
+# ─────────────────────────────────────────────────────────────────────────────────
+replay_buffer:
+  capacity: 100000 # Maximum transitions to store
+  min_size: 1000 # Minimum size before training starts
+  prioritized: false # Use prioritized experience replay (future)
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# TRAINING
+# ─────────────────────────────────────────────────────────────────────────────────
+training:
+  total_episodes: 10000 # Total training episodes
+  max_steps_per_episode: 100 # Max steps (88 tradeable + buffer)
+  train_freq: 4 # Train every N steps
+  save_freq: 100 # Save model every N episodes
+  eval_freq: 50 # Evaluate every N episodes
+  eval_episodes: 10 # Episodes per evaluation
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# CHECKPOINTING
+# ─────────────────────────────────────────────────────────────────────────────────
+checkpointing:
+  save_dir: "checkpoints" # Directory for model checkpoints
+  save_best: true # Save best model based on eval
+  keep_last_n: 5 # Keep last N checkpoints
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────────────────────
+logging:
+  log_dir: "logs" # TensorBoard log directory
+  log_freq: 10 # Log metrics every N episodes
+  verbose: 1 # 0=silent, 1=progress, 2=detailed
