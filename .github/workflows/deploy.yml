@@ -36,6 +36,12 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Log in to Docker Hub to pull BuildX
+      - name: Log in to Docker Hub   # ← ADD THIS
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # Generates two tags:
       #   ghcr.io/johanespao/asymptotic_zero:latest   ← always overwritten on main
