@@ -17,11 +17,16 @@ services:
       - TF_CPP_MIN_LOG_LEVEL=2
       - TF_ENABLE_ONEDNN_OPTS=0
 
+    # Run as the same uid/gid as the VPS user (jpao = 1001) so the mounted
+    # logs volume is always writable without manual chown on the host.
+    user: "1001:1001"
+
     # Persist log files on VPS between container restarts / image updates
     volumes:
       - ./logs:/app/logs
 
-    # No TTY — keyboard scroll disabled in headless mode.
-    # live_dashboard.py handles this gracefully (try/except in keyboard listener).
-    stdin_open: false
-    tty: false
+    # TTY enabled so Rich dashboard renders correctly when attaching.
+    # Attach with: docker attach asymptotic_zero
+    # Detach without stopping: Ctrl+P then Ctrl+Q
+    stdin_open: true
+    tty: true
