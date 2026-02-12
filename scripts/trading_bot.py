@@ -7,6 +7,8 @@ Main trading loop that connects all components:
 - Agent decision making
 - Trade execution
 - Live terminal dashboard
+
+v2: Added position reconciliation with Binance to prevent state divergence
 """
 
 import sys
@@ -144,7 +146,92 @@ class TradingBot:
             epsilon=self.agent.epsilon,
         )
 
+        # Sync positions with Binance on startup
+        print("🔄 Syncing positions with Binance...")
+        try:
+            actual_positions = self._sync_positions_with_binance()
+            print(f"✅ Position sync complete: {len(actual_positions)} open positions")
+            if actual_positions:
+                print("   Open positions found on Binance:")
+                for sym, pos in actual_positions.items():
+                    print(f"     - {sym}: {pos['side']} {pos['size']} @ ${pos['entry_price']:.2f}")
+        except Exception as e:
+            print(f"⚠️  Initial position sync failed: {e}")
+            print("   Continuing with empty position state...")
+
         print("\n🤖 Bot initialized successfully!\n")
+
+    def _sync_positions_with_binance(self) -> dict:
+        """
+        Query Binance for actual open positions and reconcile with internal state.
+        
+        This is the source of truth. Call this:
+        - On startup
+        - Before every trading decision
+        - After every order execution
+        
+        Returns:
+            Dict of actual positions from Binance
+        """
+        try:
+            # Query Binance futures positions
+            binance_positions = self.client.futures_position_information()
+            
+            # Filter to only positions with non-zero size
+            actual_positions = {}
+            for pos in binance_positions:
+                size = float(pos['positionAmt'])
+                if abs(size) > 0.0001:  # Ignore dust
+                    symbol = pos['symbol']
+                    actual_positions[symbol] = {
+                        'symbol': symbol,
+                        'side': 'LONG' if size > 0 else 'SHORT',
+                        'size': abs(size),
+                        'entry_price': float(pos['entryPrice']),
+                        'unrealized_pnl': float(pos['unRealizedProfit']),
+                        'leverage': int(pos['leverage']),
+                    }
+            
+            # Get bot's internal positions
+            internal_positions = self.executor.get_position_info()['positions']
+            internal_symbols = set(internal_positions.keys())
+            actual_symbols = set(actual_positions.keys())
+            
+            # Find discrepancies
+            ghost_positions = internal_symbols - actual_symbols
+            unknown_positions = actual_symbols - internal_symbols
+            
+            # Log and fix ghost positions (bot thinks it's open, but it's not)
+            if ghost_positions:
+                _log.warning(f"👻 Ghost positions detected (removing from internal state): {ghost_positions}")
+                for symbol in ghost_positions:
+                    # Remove from executor's internal tracking
+                    if hasattr(self.executor, 'positions'):
+                        self.executor.positions.pop(symbol, None)
+                    # Remove from guardrails
+                    self.guardrails.record_position_closed(symbol)
+            
+            # Log unknown positions (open on Binance but bot doesn't know)
+            if unknown_positions:
+                _log.warning(f"🔍 Unknown positions detected on Binance (adding to internal state): {unknown_positions}")
+                # Add them to internal state
+                for symbol in unknown_positions:
+                    pos = actual_positions[symbol]
+                    if hasattr(self.executor, 'positions'):
+                        self.executor.positions[symbol] = pos
+                    # Record in guardrails
+                    self.guardrails.record_position_opened(symbol)
+            
+            # Update executor's internal state with Binance truth
+            if hasattr(self.executor, 'positions'):
+                self.executor.positions = actual_positions.copy()
+            
+            return actual_positions
+            
+        except Exception as e:
+            _log.error(f"Position sync with Binance failed: {e}")
+            # Return empty dict on failure — better to be cautious
+            return {}
 
     def log_event(self, level: str, message: str, extra_data: dict = None):
         """Log event to file."""
@@ -590,6 +677,13 @@ class TradingBot:
                     step += 1
                     self.guardrails.step()
 
+                    # Sync positions with Binance BEFORE every decision
+                    try:
+                        actual_positions = self._sync_positions_with_binance()
+                    except Exception as e:
+                        _log.error(f"Position sync failed before step: {e}")
+                        # Continue with internal state if sync fails
+
                     # Get balance -- if this fails after retries, skip the whole step
                     try:
                         current_balance = self._retry(
@@ -684,7 +778,7 @@ class TradingBot:
                     live.update(self.dashboard.generate_dashboard())
 
                     # -- Execute Trade ---------------------------------------------
-                    old_count = self.executor.get_position_info()["count"]
+                    old_count = len(actual_positions) if 'actual_positions' in locals() else self.executor.get_position_info()["count"]
                     try:
                         trade_symbol, trade_side, trade_pnl = self._execute_action(
                             action
@@ -696,7 +790,14 @@ class TradingBot:
                         self.dashboard.error_count += 1
                         trade_symbol, trade_side, trade_pnl = "", "", 0.0
 
-                    new_count = self.executor.get_position_info()["count"]
+                    # Sync with Binance to verify order actually filled
+                    time.sleep(0.5)  # Give exchange 500ms to settle
+                    try:
+                        actual_positions = self._sync_positions_with_binance()
+                        new_count = len(actual_positions)
+                    except Exception as e:
+                        _log.error(f"Post-order position sync failed: {e}")
+                        new_count = self.executor.get_position_info()["count"]
 
                     if trade_symbol and new_count != old_count:
                         self.daily_trades += 1
