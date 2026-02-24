@@ -454,6 +454,11 @@ async def dashboard():
         
         .metric-value.positive { color: var(--green); }
         .metric-value.negative { color: var(--red); }
+        .pct-badge {
+            font-size: 12px;
+            font-weight: 500;
+            opacity: 0.85;
+        }
         
         .positions-list {
             max-height: 200px;
@@ -622,24 +627,62 @@ async def dashboard():
             background: var(--surface);
             position: sticky;
             top: 0;
-            z-index: 1;
+            z-index: 2;
         }
-        .coin-table th:first-child,
-        .coin-table td:first-child {
+        /* ── Frozen columns: Coin | 24h% | Close ─────────────────────────── */
+        .coin-table th:nth-child(1) {
             text-align: left;
             position: sticky;
             left: 0;
-            z-index: 2;
+            min-width: 72px;
+            z-index: 3;
             background: var(--surface);
         }
-        /* Slightly different bg on hover rows so sticky cell matches */
-        .coin-table tr:hover td:first-child { background: var(--surface2); }
+        .coin-table th:nth-child(2) {
+            position: sticky;
+            left: 72px;
+            min-width: 62px;
+            z-index: 3;
+            background: var(--surface);
+        }
+        .coin-table th:nth-child(3) {
+            position: sticky;
+            left: 134px;
+            min-width: 72px;
+            z-index: 3;
+            background: var(--surface);
+            border-right: 1px solid var(--border);
+        }
+        .coin-table td:nth-child(1) {
+            text-align: left;
+            position: sticky;
+            left: 0;
+            z-index: 1;
+            background: var(--surface);
+        }
+        .coin-table td:nth-child(2) {
+            position: sticky;
+            left: 72px;
+            z-index: 1;
+            background: var(--surface);
+        }
+        .coin-table td:nth-child(3) {
+            position: sticky;
+            left: 134px;
+            z-index: 1;
+            background: var(--surface);
+            border-right: 1px solid var(--border);
+        }
+        /* Slightly different bg on hover rows so sticky cells match */
+        .coin-table tr:hover td:nth-child(1),
+        .coin-table tr:hover td:nth-child(2),
+        .coin-table tr:hover td:nth-child(3) { background: var(--surface2); }
         .coin-table td {
             padding: 5px 10px;
             text-align: right;
             border-bottom: 1px solid rgba(35,40,56,0.5);
         }
-        .coin-table td:first-child { text-align: left; }
+
         .coin-table tr:hover td { background: var(--surface2); }
         .coin-table .text-left { text-align: left; }
         .coin-table .text-green { color: var(--green); }
@@ -684,7 +727,6 @@ async def dashboard():
                     <thead>
                         <tr>
                             <th style="text-align:left;">Coin</th>
-                            <th></th>
                             <th>24h%</th>
                             <th>Close</th>
                             <th>RSI</th>
@@ -700,7 +742,7 @@ async def dashboard():
                         </tr>
                     </thead>
                     <tbody id="coin-table-body">
-                        <tr><td colspan="14" style="text-align:center;color:var(--muted);padding:20px;">Waiting for data...</td></tr>
+                        <tr><td colspan="13" style="text-align:center;color:var(--muted);padding:20px;">Waiting for data...</td></tr>
                     </tbody>
                 </table>
             </div>
@@ -908,13 +950,15 @@ async def dashboard():
             const initBal = data.initial_balance || 0;
             const pnlPct = initBal > 0 ? (pnl / initBal * 100) : 0;
             const pnlElement = document.getElementById('pnl');
-            pnlElement.textContent = `$${pnl.toFixed(2)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)`;
+            const pnlSign = pnlPct >= 0 ? '+' : '';
+            pnlElement.innerHTML = `$${pnl.toFixed(2)}<br><span class="pct-badge">${pnlSign}${pnlPct.toFixed(2)}%</span>`;
             pnlElement.className = 'metric-value ' + (pnl >= 0 ? 'positive' : 'negative');
 
             const todayPnl = data.today_pnl ?? 0;
             const todayPct = initBal > 0 ? (todayPnl / initBal * 100) : 0;
             const todayPnlEl = document.getElementById('today-pnl');
-            todayPnlEl.textContent = `$${todayPnl.toFixed(2)} (${todayPct >= 0 ? '+' : ''}${todayPct.toFixed(2)}%)`;
+            const todaySign = todayPct >= 0 ? '+' : '';
+            todayPnlEl.innerHTML = `$${todayPnl.toFixed(2)}<br><span class="pct-badge">${todaySign}${todayPct.toFixed(2)}%</span>`;
             todayPnlEl.className = 'metric-value ' + (todayPnl >= 0 ? 'positive' : 'negative');
 
             // Update header title mode badge
@@ -1046,24 +1090,27 @@ async def dashboard():
         }
         
         function updatePnLChart(data) {
-            if (!pnlChart) return;
+            if (!pnlChart || !data.session_started) return;
 
-            // Expand x-axis to elapsed time + small buffer so the line
-            // always reaches the right edge and the scale grows with the session.
             const elapsed = (Date.now() - sessionStartMs) / 3600000;
             pnlChart.options.scales.x.max = Math.max(1, elapsed + 0.25);
 
-            if (data.pnl_history && data.pnl_history.length > 0) {
-                // Use server-provided history — proper time positions
+            const pts = pnlChart.data.datasets[0].data;
+
+            // Seed from server history only when the chart is empty (page load / reconnect).
+            // After that, always accumulate live points every ~2 s for real-time smoothness.
+            if (pts.length === 0 && data.pnl_history && data.pnl_history.length > 0) {
                 pnlChart.data.datasets[0].data = data.pnl_history.map(p => ({
                     x: (new Date(p.t).getTime() - sessionStartMs) / 3600000,
                     y: p.pnl,
                 }));
-            } else if (data.total_pnl !== undefined && data.session_started) {
-                // Fallback: accumulate client-side
-                const pts = pnlChart.data.datasets[0].data;
-                pts.push({ x: elapsed, y: data.total_pnl });
-                if (pts.length > 300) pts.shift();
+            }
+
+            // Always push the current live PnL (from Binance live poller, updated every 2 s)
+            const livePnl = data.total_pnl ?? 0;
+            pnlChart.data.datasets[0].data.push({ x: elapsed, y: livePnl });
+            if (pnlChart.data.datasets[0].data.length > 600) {
+                pnlChart.data.datasets[0].data.shift();
             }
 
             pnlChart.update('none');
@@ -1215,7 +1262,6 @@ async def dashboard():
 
                 html += `<tr>
 <td class="text-left ${typeCls}" style="font-weight:600;letter-spacing:0.3px;">${symShort}</td>
-<td class="${typeCls}">${typeIcon}</td>
 <td class="${chgCls}">${chgS}</td>
 <td class="${blinkCls(cls,'close')}">${fmtClose(cls)}</td>
 <td class="${rsiCls(rsi)}${blinkCls(rsi,'rsi')}">${rsiS}</td>
@@ -1253,14 +1299,15 @@ async def dashboard():
                         borderColor: '#3ecf8e',
                         borderWidth: 2,
                         tension: 0.4,
+                        cubicInterpolationMode: 'monotone',
                         fill: {
                             target: 'origin',
                             above: 'rgba(62, 207, 142, 0.15)',
                             below: 'rgba(240, 82, 82, 0.15)',
                         },
                         segment: {
-                            borderColor: ctx => {
-                                const y0 = ctx.p0.parsed.y, y1 = ctx.p1.parsed.y;
+                            borderColor: seg => {
+                                const y0 = seg.p0.parsed.y, y1 = seg.p1.parsed.y;
                                 if (y0 >= 0 && y1 >= 0) return '#3ecf8e';
                                 if (y0 <= 0 && y1 <= 0) return '#f05252';
                                 return '#aaaaaa'; // crossing segment
@@ -1273,7 +1320,20 @@ async def dashboard():
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
-                    plugins: { legend: { display: false } },
+                    plugins: {
+                        legend: { display: false },
+                        tooltip: {
+                            callbacks: {
+                                title: (items) => {
+                                    const h = items[0].parsed.x;
+                                    const ms = sessionStartMs + h * 3600000;
+                                    const d = new Date(ms);
+                                    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+                                },
+                                label: (item) => `PnL: $${item.parsed.y.toFixed(2)}`,
+                            }
+                        }
+                    },
                     parsing: false,
                     scales: {
                         x: {
