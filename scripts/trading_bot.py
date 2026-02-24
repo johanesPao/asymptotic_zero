@@ -58,7 +58,8 @@ class TradingBot:
         self.api_secret = get_secret("BINANCE_SECRET")
         self.db_url = get_secret("DATABASE_URL")
         self.trading_mode = get_secret("TRADING_MODE")
-        self.max_daily_loss = float(get_secret("MAX_DAILY_LOSS", 50))
+        self.max_daily_loss_pct = float(get_secret("MAX_DAILY_LOSS_PCT", 5.0))
+        self._daily_loss_limit = 0.0  # computed from initial_balance × pct at each screening
         self.max_daily_trades = int(get_secret("MAX_DAILY_TRADES", 10))
         self.STATE_DIM = 823
         self.ACTION_DIM = 63
@@ -819,7 +820,7 @@ class TradingBot:
         trades_norm = self.daily_trades / max(self.max_daily_trades, 1)
 
         # 5. Daily loss used (negative pnl_today / max loss)
-        loss_norm = float(np.clip(max(0.0, -pnl_today) / max(self.max_daily_loss, 1.0), 0.0, 1.0))
+        loss_norm = float(np.clip(max(0.0, -pnl_today) / max(self._daily_loss_limit, 1.0), 0.0, 1.0))
 
         return np.array([
             float(np.clip(cooldown_norm,      0, 1)),
@@ -857,7 +858,7 @@ class TradingBot:
 
         # Circuit breaker: if daily loss >= max, only HOLD/CLOSE allowed
         pnl_today = (self.current_balance or 0.0) - self.initial_balance
-        circuit_breaker = (self.initial_balance > 0) and (-pnl_today >= self.max_daily_loss)
+        circuit_breaker = (self.initial_balance > 0) and (-pnl_today >= self._daily_loss_limit)
         trade_limit_hit = self.daily_trades >= self.max_daily_trades
 
         can_open = (
@@ -1002,6 +1003,13 @@ class TradingBot:
                         self._wait_for_next_interval("Balance fetch failed")
                         continue
 
+                    # Recompute dollar loss limit from current equity each session
+                    self._daily_loss_limit = self.initial_balance * self.max_daily_loss_pct / 100.0
+                    _log.info(
+                        f"Daily loss limit: {self.max_daily_loss_pct}% of "
+                        f"${self.initial_balance:.2f} = ${self._daily_loss_limit:.2f}"
+                    )
+
                     # Close previous session in DB (if not first run)
                     if self.current_session_key:
                         self.logger.close_session(
@@ -1111,7 +1119,7 @@ class TradingBot:
                     self._peak_balance = max(self._peak_balance, current_balance)
 
                 # -- Daily Loss Limit ------------------------------------------
-                if pnl_today <= -self.max_daily_loss:
+                if pnl_today <= -self._daily_loss_limit:
                     now_iso = datetime.now().isoformat()
                     # Close each position individually and log actual outcome
                     for sym in list(self.executor.positions.keys()):
