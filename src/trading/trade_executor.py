@@ -239,6 +239,10 @@ class TradeExecutor:
             # Use actual fill price from Binance response
             actual_entry = self._get_fill_price(order)
             actual_qty = float(order.get("executedQty", quantity))
+            # Testnet sometimes returns executedQty="0" for a filled market order;
+            # fall back to our computed quantity so the cache is never size=0.
+            if actual_qty <= 0:
+                actual_qty = quantity
 
             self.positions[symbol] = {
                 "side": "LONG",
@@ -277,6 +281,8 @@ class TradeExecutor:
 
             actual_entry = self._get_fill_price(order)
             actual_qty = float(order.get("executedQty", quantity))
+            if actual_qty <= 0:
+                actual_qty = quantity
 
             self.positions[symbol] = {
                 "side": "SHORT",
@@ -305,6 +311,33 @@ class TradeExecutor:
 
             entry_price = position["entry_price"]
             size = position["size"]
+
+            # If cached size is 0 (testnet executedQty quirk), query Binance for
+            # the actual position amount before placing the closing order.
+            if size <= 0:
+                try:
+                    live = self.client.futures_position_information(symbol=symbol)
+                    for lpos in live:
+                        amt = float(lpos.get("positionAmt", 0))
+                        if abs(amt) > 0:
+                            size = abs(amt)
+                            self.positions[symbol]["size"] = size
+                            _log.warning(
+                                f"close_position {symbol}: cached size was 0, "
+                                f"recovered live size={size} from Binance"
+                            )
+                            break
+                except Exception as e:
+                    _log.warning(f"close_position {symbol}: could not fetch live size: {e}")
+
+            if size <= 0:
+                _log.error(
+                    f"close_position {symbol}: size is 0 and no live position found — "
+                    f"removing stale cache entry"
+                )
+                del self.positions[symbol]
+                return None
+
             size_usdt = size * entry_price
 
             # Place closing order first
