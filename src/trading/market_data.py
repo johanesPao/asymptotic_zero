@@ -2,10 +2,13 @@
 Market data collection from Binance.
 """
 
+import logging
 from binance.client import Client
 import polars as pl
 from typing import List, Dict
 import time
+
+_log = logging.getLogger(__name__)
 
 
 def fetch_candles(
@@ -66,9 +69,9 @@ def fetch_all_coins(
         try:
             df = fetch_candles(client, symbol, interval, limit)
             data[symbol] = df
-            print(f"[{i}/{len(symbols)}] {symbol}: {len(df)} candles")
-            time.sleep(0.1)  # Rate limting
+            _log.debug(f"[{i}/{len(symbols)}] {symbol}: {len(df)} candles")
+            time.sleep(0.2)  # Rate limiting — testnet is strict
         except Exception as e:
-            print(f"⚠️ Failed {symbol}: {e}")
+            _log.warning(f"Failed to fetch {symbol}: {e}")
 
     return data
