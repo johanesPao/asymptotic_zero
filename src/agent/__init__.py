@@ -1,35 +1,30 @@
 """
-Agent Module
-
-DQN agent for cryptocurrency trading.
-Provides neural network, replay buffer, agent, and trainer.
+Agent Module — v2 (IQN)
 
 Usage:
-    from src.agent import DQNAgent, DQNTrainer
+    from src.agent import IQNAgent
     from src.trading import make_env
 
-    # Create environment and agent
-    env = make_env()
-    agent = DQNAgent(
-        state_dim=env.get_state_space_size(),
-        action_dim=env.get_action_space_size(),
+    env   = make_env()
+    agent = IQNAgent(
+        state_dim   = env.get_state_space_size(),
+        action_size = env.get_action_space_size(),
     )
-
-    # Create trainer and train
-    trainer = DQNTrainer(env, agent)
-    trainer.train()
 """
 
-from .network import QNetwork, create_q_network
-from .replay_buffer import ReplayBuffer, Transition
-from .dqn_agent import DQNAgent
-from .trainer import DQNTrainer
+from .network import IQNNetwork
+from .replay_buffer import ReplayBuffer
+from .iqn_agent import IQNAgent
+
+# Backward-compatibility aliases so any existing scripts importing DQNAgent still work
+DQNAgent   = IQNAgent
+DQNNetwork = IQNNetwork
 
 __all__ = [
-    "QNetwork",
-    "create_q_network",
+    "IQNNetwork",
+    "IQNAgent",
     "ReplayBuffer",
-    "Transition",
+    # Aliases
     "DQNAgent",
-    "DQNTrainer",
+    "DQNNetwork",
 ]
