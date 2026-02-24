@@ -1089,28 +1089,40 @@ async def dashboard():
             `).join('');
         }
         
+        const PNL_NEW_POINT_INTERVAL = 30000; // push a genuinely new point every 30 s
+        let _lastPnlPointTime = 0;
+
         function updatePnLChart(data) {
             if (!pnlChart || !data.session_started) return;
 
-            const elapsed = (Date.now() - sessionStartMs) / 3600000;
+            const now = Date.now();
+            const elapsed = (now - sessionStartMs) / 3600000;
             pnlChart.options.scales.x.max = Math.max(1, elapsed + 0.25);
 
             const pts = pnlChart.data.datasets[0].data;
 
             // Seed from server history only when the chart is empty (page load / reconnect).
-            // After that, always accumulate live points every ~2 s for real-time smoothness.
             if (pts.length === 0 && data.pnl_history && data.pnl_history.length > 0) {
                 pnlChart.data.datasets[0].data = data.pnl_history.map(p => ({
                     x: (new Date(p.t).getTime() - sessionStartMs) / 3600000,
                     y: p.pnl,
                 }));
+                _lastPnlPointTime = now;
             }
 
-            // Always push the current live PnL (from Binance live poller, updated every 2 s)
             const livePnl = data.total_pnl ?? 0;
-            pnlChart.data.datasets[0].data.push({ x: elapsed, y: livePnl });
-            if (pnlChart.data.datasets[0].data.length > 600) {
-                pnlChart.data.datasets[0].data.shift();
+
+            // If enough time has passed, push a new point; otherwise just
+            // update the last point's y-value so the curve adjusts smoothly
+            // without creating hundreds of clustered points between hour ticks.
+            if (pts.length > 0 && (now - _lastPnlPointTime) < PNL_NEW_POINT_INTERVAL) {
+                // Update the last point in-place
+                pts[pts.length - 1].y = livePnl;
+            } else {
+                // New point
+                pts.push({ x: elapsed, y: livePnl });
+                _lastPnlPointTime = now;
+                if (pts.length > 600) pts.shift();
             }
 
             pnlChart.update('none');
