@@ -6,7 +6,7 @@ import logging
 from binance.client import Client
 import polars as pl
 from typing import List, Dict
-import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 _log = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ def fetch_all_coins(
     client: Client, symbols: List[str], interval: str = "5m", limit: int = 300
 ) -> Dict[str, pl.DataFrame]:
     """
-    Fetch candles for multiple symbols.
+    Fetch candles for multiple symbols concurrently.
 
     Args:
         client: Binance client
@@ -65,13 +65,21 @@ def fetch_all_coins(
     """
     data = {}
 
-    for i, symbol in enumerate(symbols, 1):
+    def _fetch_one(symbol: str):
         try:
-            df = fetch_candles(client, symbol, interval, limit)
-            data[symbol] = df
-            _log.debug(f"[{i}/{len(symbols)}] {symbol}: {len(df)} candles")
-            time.sleep(0.2)  # Rate limiting — testnet is strict
+            return symbol, fetch_candles(client, symbol, interval, limit)
         except Exception as e:
             _log.warning(f"Failed to fetch {symbol}: {e}")
+            return symbol, None
+
+    # Fetch all symbols in parallel; overall wall-clock time ≈ one request timeout
+    # instead of N × timeout when sequential.
+    with ThreadPoolExecutor(max_workers=min(10, len(symbols))) as pool:
+        futures = {pool.submit(_fetch_one, sym): sym for sym in symbols}
+        for future in as_completed(futures, timeout=60):
+            symbol, df = future.result()
+            if df is not None:
+                data[symbol] = df
+                _log.debug(f"{symbol}: {len(df)} candles")
 
     return data
