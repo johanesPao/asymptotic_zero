@@ -816,10 +816,6 @@ async def dashboard():
                     <div class="metric-label">Daily Trades</div>
                     <div id="daily-trades" class="metric-value">-</div>
                 </div>
-                <div class="metric">
-                    <div class="metric-label">Daily PnL</div>
-                    <div id="daily-pnl" class="metric-value">-</div>
-                </div>
             </div>
         </div>
 
@@ -909,13 +905,16 @@ async def dashboard():
             document.getElementById('initial-balance').textContent = data.initial_balance ? `$${data.initial_balance.toFixed(2)}` : '-';
             
             const pnl = data.total_pnl || 0;
+            const initBal = data.initial_balance || 0;
+            const pnlPct = initBal > 0 ? (pnl / initBal * 100) : 0;
             const pnlElement = document.getElementById('pnl');
-            pnlElement.textContent = `$${pnl.toFixed(2)}`;
+            pnlElement.textContent = `$${pnl.toFixed(2)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)`;
             pnlElement.className = 'metric-value ' + (pnl >= 0 ? 'positive' : 'negative');
 
             const todayPnl = data.today_pnl ?? 0;
+            const todayPct = initBal > 0 ? (todayPnl / initBal * 100) : 0;
             const todayPnlEl = document.getElementById('today-pnl');
-            todayPnlEl.textContent = `$${todayPnl.toFixed(2)}`;
+            todayPnlEl.textContent = `$${todayPnl.toFixed(2)} (${todayPct >= 0 ? '+' : ''}${todayPct.toFixed(2)}%)`;
             todayPnlEl.className = 'metric-value ' + (todayPnl >= 0 ? 'positive' : 'negative');
 
             // Update header title mode badge
@@ -950,11 +949,6 @@ async def dashboard():
             const guardrails = data.guardrail_status || {};
             document.getElementById('cooldown').textContent = guardrails.cooldown_remaining || '0';
             document.getElementById('daily-trades').textContent = guardrails.daily_trades || '0';
-            
-            const dailyPnl = guardrails.daily_pnl || 0;
-            const dailyPnlElement = document.getElementById('daily-pnl');
-            dailyPnlElement.textContent = `$${dailyPnl.toFixed(2)}`;
-            dailyPnlElement.className = 'metric-value ' + (dailyPnl >= 0 ? 'positive' : 'negative');
             
             // Update positions
             updatePositions(data.current_positions || []);
@@ -1053,21 +1047,26 @@ async def dashboard():
         
         function updatePnLChart(data) {
             if (!pnlChart) return;
+
+            // Expand x-axis to elapsed time + small buffer so the line
+            // always reaches the right edge and the scale grows with the session.
+            const elapsed = (Date.now() - sessionStartMs) / 3600000;
+            pnlChart.options.scales.x.max = Math.max(1, elapsed + 0.25);
+
             if (data.pnl_history && data.pnl_history.length > 0) {
                 // Use server-provided history — proper time positions
                 pnlChart.data.datasets[0].data = data.pnl_history.map(p => ({
                     x: (new Date(p.t).getTime() - sessionStartMs) / 3600000,
                     y: p.pnl,
                 }));
-                pnlChart.update('none');
             } else if (data.total_pnl !== undefined && data.session_started) {
                 // Fallback: accumulate client-side
-                const x = (Date.now() - sessionStartMs) / 3600000;
                 const pts = pnlChart.data.datasets[0].data;
-                pts.push({ x, y: data.total_pnl });
+                pts.push({ x: elapsed, y: data.total_pnl });
                 if (pts.length > 300) pts.shift();
-                pnlChart.update('none');
             }
+
+            pnlChart.update('none');
         }
         
         function initSessionChart() {
@@ -1246,33 +1245,50 @@ async def dashboard():
             computeSessionStart();
             const ctx = document.getElementById('pnl-chart').getContext('2d');
             pnlChart = new Chart(ctx, {
-                type: 'scatter',
+                type: 'line',
                 data: {
                     datasets: [{
                         label: 'Total PnL',
                         data: [],
-                        borderColor: '#4f8ef7',
-                        backgroundColor: 'rgba(79, 142, 247, 0.1)',
-                        showLine: true,
-                        tension: 0.3,
-                        fill: true,
-                        pointRadius: 2,
+                        borderColor: '#3ecf8e',
+                        borderWidth: 2,
+                        tension: 0.4,
+                        fill: {
+                            target: 'origin',
+                            above: 'rgba(62, 207, 142, 0.15)',
+                            below: 'rgba(240, 82, 82, 0.15)',
+                        },
+                        segment: {
+                            borderColor: ctx => {
+                                const y0 = ctx.p0.parsed.y, y1 = ctx.p1.parsed.y;
+                                if (y0 >= 0 && y1 >= 0) return '#3ecf8e';
+                                if (y0 <= 0 && y1 <= 0) return '#f05252';
+                                return '#aaaaaa'; // crossing segment
+                            },
+                        },
+                        pointRadius: 0,
+                        pointHoverRadius: 4,
                     }]
                 },
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: { legend: { display: false } },
+                    parsing: false,
                     scales: {
                         x: {
                             type: 'linear',
                             min: 0,
-                            max: 24,
+                            max: 1,
                             ticks: {
                                 stepSize: 1,
                                 color: '#616b82',
-                                // Only label every 4 hours → 6 ticks (00:00, 04:00, … 20:00)
-                                callback: (v) => (Number.isInteger(v) && v % 4 === 0) ? sessionHoursToLabel(v) : '',
+                                // Show every elapsed integer hour as HH:00
+                                callback: (v) => {
+                                    if (!Number.isInteger(v)) return '';
+                                    const elapsed = (Date.now() - sessionStartMs) / 3600000;
+                                    return v <= Math.floor(elapsed) ? sessionHoursToLabel(v) : '';
+                                },
                                 autoSkip: false,
                                 maxRotation: 0,
                             },
