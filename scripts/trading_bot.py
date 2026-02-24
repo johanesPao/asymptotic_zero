@@ -94,8 +94,9 @@ class TradingBot:
         self.open_trade_keys: dict = {}
         self._last_close_exit_prices: dict = {}
 
-        # Activity log, PnL history, and market features for web dashboard
+        # Activity log, PnL history, recent trades, and market features for web dashboard
         self._activity_log: list = []
+        self._recent_trades: list = []
         self._session_started: str = ""
         self._pnl_history: list = []
         self._last_market_features: dict = {}
@@ -301,7 +302,7 @@ class TradingBot:
                 "win_rate": winning / total if total > 0 else 0.0,
                 "trade_count": self.daily_trades,
                 "current_positions": pos_list,
-                "recent_trades": [],
+                "recent_trades": list(reversed(self._recent_trades[-20:])),
                 "agent_status": "active",
                 "epsilon": float(self.agent.epsilon),
                 "current_step": step,
@@ -453,6 +454,17 @@ class TradingBot:
                 if result:
                     self.guardrails.record_position_closed(symbol)
                     self._last_close_exit_prices[symbol] = result.get("exit_price", 0.0)
+                    self._recent_trades.append({
+                        "symbol": symbol,
+                        "side": result["side"],
+                        "entry_price": round(result.get("entry_price", 0.0), 6),
+                        "exit_price": round(result.get("exit_price", 0.0), 6),
+                        "pnl": round(result["pnl"], 4),
+                        "pnl_pct": round(result.get("pnl_pct", 0.0), 2),
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                    if len(self._recent_trades) > 20:
+                        self._recent_trades = self._recent_trades[-20:]
                     return symbol, result["side"], result["pnl"]
                 return "", "", 0.0
 
@@ -491,14 +503,41 @@ class TradingBot:
                 if result:
                     self.guardrails.record_position_closed(symbol)
                     self._last_close_exit_prices[symbol] = result.get("exit_price", 0.0)
+                    self._recent_trades.append({
+                        "symbol": symbol,
+                        "side": result["side"],
+                        "entry_price": round(result.get("entry_price", 0.0), 6),
+                        "exit_price": round(result.get("exit_price", 0.0), 6),
+                        "pnl": round(result["pnl"], 4),
+                        "pnl_pct": round(result.get("pnl_pct", 0.0), 2),
+                        "timestamp": datetime.now().isoformat(),
+                    })
+                    if len(self._recent_trades) > 20:
+                        self._recent_trades = self._recent_trades[-20:]
                     return symbol, result["side"], result["pnl"]
                 return "", "", 0.0
 
             case 61:
                 # CLOSE_ALL bypasses guardrails (emergency exit)
-                closed = self.executor.close_all_positions()
+                # Snapshot positions before closing so we can log each symbol
+                positions_snapshot = dict(self.executor.positions)
+                self.executor.close_all_positions()
                 for symbol in list(self.guardrails.position_history.keys()):
                     self.guardrails.record_position_closed(symbol)
+                now = datetime.now().isoformat()
+                for sym, pos in positions_snapshot.items():
+                    self._log_activity(f"CLOSE_ALL: {sym} ({pos['side']}) closed")
+                    self._recent_trades.append({
+                        "symbol": sym,
+                        "side": pos["side"],
+                        "entry_price": round(pos.get("entry_price", 0.0), 6),
+                        "exit_price": 0.0,
+                        "pnl": 0.0,
+                        "pnl_pct": 0.0,
+                        "timestamp": now,
+                    })
+                if len(self._recent_trades) > 20:
+                    self._recent_trades = self._recent_trades[-20:]
                 return "ALL", "CLOSE", 0.0
 
             case 62:
@@ -1176,11 +1215,13 @@ class TradingBot:
                             _log.error(f"DB log_trade_close failed: {e}")
 
                 # -- Write state for web dashboard --------------------------------
-                if trade_symbol:
+                if trade_symbol and trade_symbol != "ALL":
                     self._log_activity(
                         f"Step {step}: {action_str}"
                         + (f" → PnL {trade_pnl:+.2f}" if trade_pnl else " → opened")
                     )
+                elif trade_symbol == "ALL":
+                    self._log_activity(f"Step {step}: {action_str}")
                 else:
                     self._log_activity(f"Step {step}: {action_str}")
                 self._write_metrics(step, current_balance, action_str, avg_q, today_pnl)
