@@ -1139,13 +1139,34 @@ class TradingBot:
                         f"Daily loss limit hit (${pnl_today:.2f}) — closed all positions",
                         0.0, pnl_today,
                     )
-                    # Wait until next 7 AM
+                    # Wait until next 7 AM — heartbeat every 5 min so the
+                    # dashboard shows the bot is alive, just benched for the day.
+                    _heartbeat_msgs = [
+                        "🛌 Sleeping it off… back at 7 AM",
+                        "☕ Taking a breather… markets will still be there tomorrow",
+                        "🧘 Meditating on today's losses… resumes at 7 AM",
+                        "🌙 Lights out for today — see you at dawn",
+                        "🤕 Licking wounds… trading resumes at 7 AM",
+                        "📵 Do Not Disturb — daily limit reached, resuming at 7 AM",
+                        "🔋 Recharging… back in action at 7 AM",
+                        "🎯 Tomorrow is another day — standing by until 7 AM",
+                    ]
+                    _hb_idx = 0
                     while True:
                         time.sleep(300)
-                        if datetime.now().hour == 7 and (
+                        now = datetime.now()
+                        resume_in = f"resumes at 07:00 ({(7 - now.hour) % 24}h away)"
+                        msg = _heartbeat_msgs[_hb_idx % len(_heartbeat_msgs)]
+                        _hb_idx += 1
+                        self._write_metrics(
+                            step, current_balance,
+                            f"{msg} — {resume_in}",
+                            0.0, pnl_today,
+                            record_history=False,
+                        )
+                        if now.hour == 7 and (
                             last_screening_time is None
-                            or datetime.now() - last_screening_time
-                            > timedelta(hours=1)
+                            or now - last_screening_time > timedelta(hours=1)
                         ):
                             break
                     continue
