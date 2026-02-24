@@ -146,9 +146,7 @@ class TradingBot:
             print("✅ Trade executor initialized")
 
         # Initialize guardrails
-        self.guardrails = GuardrailManager(
-            cooldown_steps=5, min_hold_steps=3, max_positions=3
-        )
+        self.guardrails = GuardrailManager(max_positions=3)
         print("✅ Guardrails initialized (5-step cooldown, 3-step min hold)")
 
         # Trading state
@@ -881,25 +879,15 @@ class TradingBot:
         Compute 5 guardrail state features.
         Mirrors environment._compute_guardrail_features() using live GuardrailManager state.
         """
-        status = self.guardrails.get_status()
-        cooldown_remaining = status["cooldown_remaining"]
-        position_ages = status["position_ages"]  # {symbol: steps_held}
-
         positions = self.executor.get_position_info()["positions"]
         num_positions = len(positions)
 
-        # 1. Cooldown remaining (normalized)
-        cooldown_norm = cooldown_remaining / max(self.guardrails.cooldown_steps, 1)
+        # 1. Cooldown remaining — always 0 (removed from live guardrails;
+        #    agent learned trading frequency via reward shaping during training)
+        cooldown_norm = 0.0
 
-        # 2. Average hold remaining across open positions (normalized)
-        if positions:
-            holds_remaining = [
-                max(0, self.guardrails.min_hold_steps - position_ages.get(sym, self.guardrails.min_hold_steps))
-                for sym in positions
-            ]
-            avg_hold_remaining = float(np.mean(holds_remaining)) / max(self.guardrails.min_hold_steps, 1)
-        else:
-            avg_hold_remaining = 0.0
+        # 2. Average hold remaining — always 0 (same reason)
+        avg_hold_remaining = 0.0
 
         # 3. Position slots used
         slots_used = num_positions / max(self.max_positions, 1)
@@ -971,21 +959,15 @@ class TradingBot:
                     mask[31 + local_idx] = True  # LONG loser
                     mask[41 + local_idx] = True  # SHORT loser
 
-            # Close actions — only if min hold satisfied
+            # Close actions — always allowed (no min-hold in live trading)
             if symbol in positions:
-                steps_held = position_ages.get(symbol, self.guardrails.min_hold_steps)
-                if steps_held >= self.guardrails.min_hold_steps:
-                    if is_gainer:
-                        mask[21 + local_idx] = True  # CLOSE gainer
-                    else:
-                        mask[51 + local_idx] = True  # CLOSE loser
+                if is_gainer:
+                    mask[21 + local_idx] = True  # CLOSE gainer
+                else:
+                    mask[51 + local_idx] = True  # CLOSE loser
 
         # CLOSE_ALL (61) and CLOSE_WORST (62)
-        has_closable = any(
-            position_ages.get(sym, self.guardrails.min_hold_steps) >= self.guardrails.min_hold_steps
-            for sym in positions
-        )
-        if has_closable:
+        if positions:
             mask[61] = True
             mask[62] = True
 
