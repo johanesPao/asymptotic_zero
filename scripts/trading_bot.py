@@ -986,13 +986,17 @@ class TradingBot:
                     self.winning_trades = 0
                     self.losing_trades = 0
 
-                    # Get initial balance with retry
+                    # Get initial balance with retry.
+                    # Use get_equity() (wallet + unrealized) so the baseline
+                    # matches current_balance in the step loop, preventing
+                    # inherited unrealized losses from immediately triggering
+                    # the daily loss limit on restart.
                     try:
                         self.initial_balance = self._retry(
-                            self.executor.get_balance,
+                            self.executor.get_equity,
                             retries=3,
                             delay=5.0,
-                            label="get_balance (screening)",
+                            label="get_equity (screening)",
                         )
                     except Exception:
                         self._wait_for_next_interval("Balance fetch failed")
