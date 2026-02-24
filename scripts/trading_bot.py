@@ -937,12 +937,20 @@ class TradingBot:
                 if should_screen:
                     # Close all before re-screening (not first run)
                     if last_screening_time is not None:
-                        positions_snapshot = dict(self.executor.positions)
-                        self.executor.close_all_positions()
-                        for sym, pos in positions_snapshot.items():
-                            self._log_activity(
-                                f"Re-screening: closed {sym} ({pos['side']})"
-                            )
+                        for sym in list(self.executor.positions.keys()):
+                            pos = self.executor.positions.get(sym)
+                            if pos is None:
+                                continue
+                            result = self.executor.close_position(sym)
+                            if result:
+                                self._log_activity(
+                                    f"Re-screening: closed {sym} ({pos['side']})"
+                                    + f" → PnL {result['pnl']:+.2f}"
+                                )
+                            else:
+                                self._log_activity(
+                                    f"Re-screening: FAILED to close {sym} ({pos['side']})"
+                                )
                         for sym in list(self.guardrails.position_history.keys()):
                             self.guardrails.record_position_closed(sym)
 
@@ -1099,22 +1107,31 @@ class TradingBot:
 
                 # -- Daily Loss Limit ------------------------------------------
                 if pnl_today <= -self.max_daily_loss:
-                    positions_snapshot = dict(self.executor.positions)
-                    self.executor.close_all_positions()
                     now_iso = datetime.now().isoformat()
-                    for sym, pos in positions_snapshot.items():
-                        self._log_activity(
-                            f"Daily loss limit hit: closed {sym} ({pos['side']})"
-                        )
-                        self._recent_trades.append({
-                            "symbol": sym,
-                            "side": pos["side"],
-                            "entry_price": round(pos.get("entry_price", 0.0), 6),
-                            "exit_price": 0.0,
-                            "pnl": 0.0,
-                            "pnl_pct": 0.0,
-                            "timestamp": now_iso,
-                        })
+                    # Close each position individually and log actual outcome
+                    for sym in list(self.executor.positions.keys()):
+                        pos = self.executor.positions.get(sym)
+                        if pos is None:
+                            continue
+                        result = self.executor.close_position(sym)
+                        if result:
+                            self._log_activity(
+                                f"Daily loss limit hit: closed {sym} ({pos['side']})"
+                                + f" → PnL {result['pnl']:+.2f}"
+                            )
+                            self._recent_trades.append({
+                                "symbol": sym,
+                                "side": pos["side"],
+                                "entry_price": round(pos.get("entry_price", 0.0), 6),
+                                "exit_price": round(result.get("exit_price", 0.0), 6),
+                                "pnl": round(result["pnl"], 4),
+                                "pnl_pct": round(result.get("pnl_pct", 0.0), 2),
+                                "timestamp": now_iso,
+                            })
+                        else:
+                            self._log_activity(
+                                f"Daily loss limit hit: FAILED to close {sym} ({pos['side']})"
+                            )
                     if len(self._recent_trades) > 20:
                         self._recent_trades = self._recent_trades[-20:]
                     self._write_metrics(
