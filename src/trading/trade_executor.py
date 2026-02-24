@@ -42,6 +42,9 @@ class TradeExecutor:
         # Cache of symbol lot-size step per symbol {symbol: step_size float}
         # Populated lazily on first order for each symbol.
         self._lot_step_cache: Dict[str, float] = {}
+        # Cache of max order quantity per symbol {symbol: max_qty float}
+        # Populated in the same exchange_info fetch as _lot_step_cache.
+        self._max_qty_cache: Dict[str, float] = {}
 
         # Cache of max notional per symbol at self.leverage {symbol: max_notional float}
         # Used to cap order size and avoid -2027 errors.
@@ -50,7 +53,13 @@ class TradeExecutor:
     def get_current_price(self, symbol: str) -> float:
         """Get current market price for symbol."""
         ticker = self.client.futures_symbol_ticker(symbol=symbol)
-        return float(ticker["price"])
+        # Some testnet symbols return lastPrice instead of price
+        if isinstance(ticker, list):
+            ticker = ticker[0] if ticker else {}
+        raw = ticker.get("price") or ticker.get("lastPrice")
+        if not raw or float(raw) == 0:
+            raise ValueError(f"No valid price for {symbol}: {ticker}")
+        return float(raw)
 
     def get_balance(self) -> float:
         """Get wallet balance (cash only, no unrealized PnL).
@@ -89,17 +98,28 @@ class TradeExecutor:
             _log.debug(f"set_leverage {symbol}: {e}")
 
     def _get_lot_step(self, symbol: str) -> float:
-        """Return the LOT_SIZE step for symbol, cached after first fetch."""
+        """Return the LOT_SIZE step for symbol, cached after first fetch.
+        Also populates _max_qty_cache in the same API call.
+
+        Uses the stricter of LOT_SIZE.maxQty and MARKET_LOT_SIZE.maxQty —
+        the latter applies specifically to MARKET orders and is often lower.
+        """
         if symbol not in self._lot_step_cache:
             try:
                 info = self.client.futures_exchange_info()
                 for s in info["symbols"]:
                     step = 1.0
+                    max_qty = float("inf")
                     for f in s["filters"]:
                         if f["filterType"] == "LOT_SIZE":
                             step = float(f["stepSize"])
-                            break
+                            max_qty = float(f.get("maxQty", "inf"))
+                        elif f["filterType"] == "MARKET_LOT_SIZE":
+                            # Market-order-specific limit — often stricter than LOT_SIZE
+                            market_max = float(f.get("maxQty", "inf"))
+                            max_qty = min(max_qty, market_max)
                     self._lot_step_cache[s["symbol"]] = step
+                    self._max_qty_cache[s["symbol"]] = max_qty
             except Exception as e:
                 _log.warning(f"Could not fetch exchange info for {symbol}: {e}")
                 return 1.0  # safe fallback — integer quantity
@@ -109,33 +129,55 @@ class TradeExecutor:
         """Return the maximum notional allowed at self.leverage for symbol.
 
         Queries futures_leverage_bracket once per symbol and caches.  Falls back
-        to a conservative $5 000 cap if the bracket cannot be fetched so that we
+        to a conservative $500 cap if the bracket cannot be fetched so that we
         never hit -2027 ("Exceeded maximum allowable position at current leverage").
+
+        Bracket selection: each bracket covers a notional range and its
+        initialLeverage is the max leverage allowed in that range.  We want the
+        bracket with the *smallest* initialLeverage that is still >= self.leverage
+        — that bracket has the highest notionalCap that still permits our leverage.
+        This approach is order-independent (does not rely on bracket sort order).
         """
         if symbol not in self._max_notional_cache:
             try:
                 brackets = self.client.futures_leverage_bracket(symbol=symbol)
                 # Response: [{"symbol": "...", "brackets": [{...}, ...]}, ...]
                 sym_data = brackets[0] if brackets else {}
-                max_notional = 5_000.0  # conservative fallback
+                best_lev: float | None = None
+                best_notional: float | None = None
                 for b in sym_data.get("brackets", []):
-                    if b.get("initialLeverage", 0) >= self.leverage:
-                        max_notional = float(b["notionalCap"])
+                    lev = b.get("initialLeverage", 0)
+                    if lev >= self.leverage:
+                        if best_lev is None or lev < best_lev:
+                            best_lev = lev
+                            best_notional = float(b["notionalCap"])
+                if best_notional is not None:
+                    max_notional = best_notional
+                else:
+                    # No bracket supports our leverage — very conservative cap
+                    max_notional = 500.0
+                    _log.warning(
+                        f"No bracket for {symbol} supports {self.leverage}x leverage "
+                        f"— using $500 cap"
+                    )
                 self._max_notional_cache[symbol] = max_notional
             except Exception as e:
-                _log.warning(f"Could not fetch leverage bracket for {symbol}: {e} — using $5000 cap")
-                self._max_notional_cache[symbol] = 5_000.0
+                _log.warning(f"Could not fetch leverage bracket for {symbol}: {e} — using $500 cap")
+                self._max_notional_cache[symbol] = 500.0
         return self._max_notional_cache[symbol]
 
     def _round_quantity(self, symbol: str, quantity: float) -> float:
-        """Floor quantity to the nearest valid LOT_SIZE step.
+        """Floor quantity to the nearest valid LOT_SIZE step, capped to maxQty.
 
         Uses floor (not round) so we never accidentally exceed our
         intended position size or trip a max-notional filter.
         """
         step = self._get_lot_step(symbol)
+        max_qty = self._max_qty_cache.get(symbol, float("inf"))
         # floor to step, then remove floating-point noise
         floored = math.floor(quantity / step) * step
+        # cap to symbol's max order quantity (avoids -4005 errors)
+        floored = min(floored, max_qty)
         # determine decimal places from step to format cleanly
         if step >= 1.0:
             return float(int(floored))
