@@ -67,7 +67,6 @@ class TradingBot:
         # Initialize Binance Client
         self.client = Client(
             self.api_key, self.api_secret, testnet=(self.trading_mode == "testnet"),
-            requests_params={"timeout": 30},  # 30s per request — prevents infinite hang on slow testnet
         )
 
         # Fix time offset
@@ -196,6 +195,7 @@ class TradingBot:
         action_str: str = "",
         avg_q: float = 0.0,
         today_pnl: float = 0.0,
+        record_history: bool = True,
     ) -> None:
         """Write live bot state to live_trading_metrics.json for the web dashboard."""
         try:
@@ -219,12 +219,13 @@ class TradingBot:
             total = winning + losing
             g_status = self.guardrails.get_status()
 
-            self._pnl_history.append({
-                "t": datetime.now().isoformat(),
-                "pnl": float(current_balance - self.initial_balance),
-            })
-            if len(self._pnl_history) > 300:
-                self._pnl_history = self._pnl_history[-300:]
+            if record_history:
+                self._pnl_history.append({
+                    "t": datetime.now().isoformat(),
+                    "pnl": float(current_balance - self.initial_balance),
+                })
+                if len(self._pnl_history) > 300:
+                    self._pnl_history = self._pnl_history[-300:]
 
             # Build per-coin table for web dashboard
             coin_table = []
@@ -936,7 +937,12 @@ class TradingBot:
                 if should_screen:
                     # Close all before re-screening (not first run)
                     if last_screening_time is not None:
+                        positions_snapshot = dict(self.executor.positions)
                         self.executor.close_all_positions()
+                        for sym, pos in positions_snapshot.items():
+                            self._log_activity(
+                                f"Re-screening: closed {sym} ({pos['side']})"
+                            )
                         for sym in list(self.guardrails.position_history.keys()):
                             self.guardrails.record_position_closed(sym)
 
@@ -1011,14 +1017,52 @@ class TradingBot:
                     self._log_activity(
                         f"Screened — gainers: {gainers_str} | losers: {losers_str}"
                     )
+
+                    # Handle positions synced from Binance at startup.
+                    # Positions not in the new screened list are invisible to the
+                    # agent (no state features, no close actions) — close them now.
+                    # Positions that ARE in the list get registered with guardrails
+                    # so the agent sees them correctly in the state.
+                    all_screened = set(
+                        self.current_coins["gainers"] + self.current_coins["losers"]
+                    )
+                    now_iso = datetime.now().isoformat()
+                    for sym, pos in list(self.executor.positions.items()):
+                        if sym not in all_screened:
+                            result = self.executor.close_position(sym)
+                            self._log_activity(
+                                f"Startup: closed {sym} ({pos['side']}) — not in screened list"
+                                + (f" → PnL {result['pnl']:+.2f}" if result else " (close failed)")
+                            )
+                            if result:
+                                self._recent_trades.append({
+                                    "symbol": sym,
+                                    "side": pos["side"],
+                                    "entry_price": round(pos.get("entry_price", 0.0), 6),
+                                    "exit_price": round(result.get("exit_price", 0.0), 6),
+                                    "pnl": round(result["pnl"], 4),
+                                    "pnl_pct": round(result.get("pnl_pct", 0.0), 2),
+                                    "timestamp": now_iso,
+                                })
+                        else:
+                            # Screened position: register with guardrails at step 0
+                            # so min-hold and cooldown apply correctly going forward
+                            if sym not in self.guardrails.position_history:
+                                self.guardrails.record_position_opened(sym)
+                    if len(self._recent_trades) > 20:
+                        self._recent_trades = self._recent_trades[-20:]
+
                     self._write_metrics(0, self.initial_balance, "Screened")
 
                 # -- Step ------------------------------------------------------
                 step += 1
                 self.guardrails.step()
 
-                # Signal the dashboard that we are working on this step
-                self._write_metrics(step, self.initial_balance, f"Step {step}: fetching data…")
+                # Signal the dashboard that we are working on this step.
+                # record_history=False: balance is stale here (equity not fetched yet),
+                # so don't add a misleading $0.00 point to pnl_history.
+                self._write_metrics(step, self.initial_balance, f"Step {step}: fetching data…",
+                                    record_history=False)
 
                 # Get equity (wallet + unrealized) for each step.
                 # initial_balance uses get_balance() (wallet only) so that
@@ -1055,7 +1099,29 @@ class TradingBot:
 
                 # -- Daily Loss Limit ------------------------------------------
                 if pnl_today <= -self.max_daily_loss:
+                    positions_snapshot = dict(self.executor.positions)
                     self.executor.close_all_positions()
+                    now_iso = datetime.now().isoformat()
+                    for sym, pos in positions_snapshot.items():
+                        self._log_activity(
+                            f"Daily loss limit hit: closed {sym} ({pos['side']})"
+                        )
+                        self._recent_trades.append({
+                            "symbol": sym,
+                            "side": pos["side"],
+                            "entry_price": round(pos.get("entry_price", 0.0), 6),
+                            "exit_price": 0.0,
+                            "pnl": 0.0,
+                            "pnl_pct": 0.0,
+                            "timestamp": now_iso,
+                        })
+                    if len(self._recent_trades) > 20:
+                        self._recent_trades = self._recent_trades[-20:]
+                    self._write_metrics(
+                        step, current_balance,
+                        f"Daily loss limit hit (${pnl_today:.2f}) — closed all positions",
+                        0.0, pnl_today,
+                    )
                     # Wait until next 7 AM
                     while True:
                         time.sleep(300)
@@ -1078,7 +1144,7 @@ class TradingBot:
                         all_symbols,
                         interval="5m",
                         limit=300,
-                        retries=3,
+                        retries=1,
                         delay=5.0,
                         label="fetch_all_coins",
                     )
@@ -1216,14 +1282,19 @@ class TradingBot:
 
                 # -- Write state for web dashboard --------------------------------
                 if trade_symbol and trade_symbol != "ALL":
+                    # Trade executed successfully
                     self._log_activity(
                         f"Step {step}: {action_str}"
                         + (f" → PnL {trade_pnl:+.2f}" if trade_pnl else " → opened")
                     )
                 elif trade_symbol == "ALL":
+                    # CLOSE_ALL (per-symbol entries already logged inside _execute_action)
                     self._log_activity(f"Step {step}: {action_str}")
+                elif action_str == "HOLD":
+                    self._log_activity(f"Step {step}: HOLD")
                 else:
-                    self._log_activity(f"Step {step}: {action_str}")
+                    # Agent chose a trade action but it was blocked or failed
+                    self._log_activity(f"Step {step}: {action_str} → no trade")
                 self._write_metrics(step, current_balance, action_str, avg_q, today_pnl)
 
                 # -- Countdown -------------------------------------------------
