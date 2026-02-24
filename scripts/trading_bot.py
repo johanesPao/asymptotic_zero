@@ -11,6 +11,7 @@ Main trading loop that connects all components:
 
 import sys
 from pathlib import Path
+import random
 import time
 from datetime import datetime, timedelta
 import numpy as np
@@ -1150,14 +1151,54 @@ class TradingBot:
                         "📵 Do Not Disturb — daily limit reached, resuming at 7 AM",
                         "🔋 Recharging… back in action at 7 AM",
                         "🎯 Tomorrow is another day — standing by until 7 AM",
+                        "💤 Zzzz… the market can wait",
+                        "🏖️ On vacation (involuntarily) — back at 7 AM",
+                        "🍵 Brewing tea and regretting life choices…",
+                        "🐢 Slow and steady… but first, a nap",
+                        "🎮 Playing video games until the market reopens",
+                        "🌊 Riding out the storm — resumes at 7 AM",
+                        "🙃 Everything is fine. Totally fine. Resuming at 7 AM",
+                        "📉 What goes down must come up… probably… at 7 AM",
+                        "🤖 Bot.exe has stopped trading and is now coping",
+                        "🧊 Keeping it cool after a rough session",
+                        "🦥 Maximum chill mode activated — until 7 AM",
+                        "🪫 Running on empty — recharging overnight",
+                        "🌚 Gone dark for the night. See you at sunrise",
+                        "🎵 Playing sad violin music until 7 AM",
+                        "🍕 Stress-eating virtual pizza until morning",
+                        "🔕 Muted. Daily limit hit. Not taking calls",
+                        "💸 Watching the PnL like a horror movie… paused at 7 AM",
+                        "🧯 Fire's out. Bot is cooling down until dawn",
+                        "🪞 Reflecting on decisions. Will do better tomorrow",
+                        "⛔ No more trades today. The market has been grounded",
+                        "🎲 Lesson learned: not every candle is a friend",
+                        "🌛 Goodnight, cruel market — see you at 7 AM",
+                        "🐣 Going back into the egg until morning",
+                        "🏳️ Waving the white flag for today — back at 7 AM",
+                        "🚫 Closed for emotional damage. Reopens at 7 AM",
+                        "⏸️ Trading paused. Dignity partially intact",
+                        "🧠 Running post-mortem analysis… aka lying in bed thinking",
+                        "😮‍💨 Exhaling deeply… resuming at 7 AM",
+                        "🛸 Beaming out of this dimension until 7 AM",
+                        "🌴 Out of office — daily loss limit reached",
+                        "🔐 Wallet locked for its own protection until dawn",
+                        "🐻 Hibernating until the bulls show up at 7 AM",
+                        "🌀 In the void… will return at 7 AM",
+                        "⚰️ Today's PnL RIP. Tomorrow is a new chapter",
+                        "🤞 Fingers crossed for tomorrow — standing by until 7 AM",
+                        "🦔 Curled up in a ball until market hours",
+                        "🎬 That's a wrap on today — scene resumes at 7 AM",
+                        "🍀 Saving all the luck for tomorrow",
+                        "🧸 Hugging the stop-loss plushie until morning",
+                        "💡 Idea: maybe trade less tomorrow. Thinking about it until 7 AM",
+                        "🌤️ Waiting for clearer skies at 7 AM",
+                        "📖 Reading 'How to Not Lose Money' until dawn",
                     ]
-                    _hb_idx = 0
                     while True:
                         time.sleep(300)
                         now = datetime.now()
                         resume_in = f"resumes at 07:00 ({(7 - now.hour) % 24}h away)"
-                        msg = _heartbeat_msgs[_hb_idx % len(_heartbeat_msgs)]
-                        _hb_idx += 1
+                        msg = random.choice(_heartbeat_msgs)
                         self._write_metrics(
                             step, current_balance,
                             f"{msg} — {resume_in}",
