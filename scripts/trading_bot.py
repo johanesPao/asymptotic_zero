@@ -6,7 +6,7 @@ Main trading loop that connects all components:
 - Market data collection
 - Agent decision making
 - Trade execution
-- Live terminal dashboard
+- Web dashboard state updates
 """
 
 import sys
@@ -39,12 +39,10 @@ from src.data_pipeline.features.technical_indicators import TechnicalIndicators
 from src.trading.state_builder import StateBuilder
 from src.trading.trade_executor import TradeExecutor
 from src.trading.guardrails import GuardrailManager
-from src.trading.live_dashboard import LiveTradingDashboard
 
 # DQNAgent (TensorFlow) is imported lazily inside __init__, AFTER the DB
 # warmup connection.  TensorFlow bundles its own libssl.so; if it loads
 # before psycopg2's first connect(), two OpenSSL instances clash → SIGSEGV.
-from rich.live import Live
 
 
 class TradingBot:
@@ -61,14 +59,15 @@ class TradingBot:
         self.trading_mode = get_secret("TRADING_MODE")
         self.max_daily_loss = float(get_secret("MAX_DAILY_LOSS", 50))
         self.max_daily_trades = int(get_secret("MAX_DAILY_TRADES", 10))
-        self.STATE_DIM = 3907
+        self.STATE_DIM = 823
         self.ACTION_DIM = 63
 
         print(f"✅ Secrets loaded (mode: {self.trading_mode})")
 
         # Initialize Binance Client
         self.client = Client(
-            self.api_key, self.api_secret, testnet=(self.trading_mode == "testnet")
+            self.api_key, self.api_secret, testnet=(self.trading_mode == "testnet"),
+            requests_params={"timeout": 30},  # 30s per request — prevents infinite hang on slow testnet
         )
 
         # Fix time offset
@@ -95,31 +94,52 @@ class TradingBot:
         self.open_trade_keys: dict = {}
         self._last_close_exit_prices: dict = {}
 
+        # Activity log, PnL history, and market features for web dashboard
+        self._activity_log: list = []
+        self._session_started: str = ""
+        self._pnl_history: list = []
+        self._last_market_features: dict = {}
+
         print("✅ DB logger initialized (libpq/OpenSSL warmed up)")
 
         # Load trained agent — TensorFlow imports HERE, after libpq is warm.
-        from src.agent.dqn_agent import DQNAgent
+        from src.agent.iqn_agent import IQNAgent
 
-        self.agent = DQNAgent(state_dim=self.STATE_DIM, action_dim=self.ACTION_DIM)
-        dummy_state = np.zeros((1, self.STATE_DIM))
-        self.agent.q_network(dummy_state)
-        self.agent.target_network(dummy_state)
+        self.agent = IQNAgent(state_dim=self.STATE_DIM, action_size=self.ACTION_DIM)
+        # Warm up networks - handle LSTM vs flat state
+        # Warm up networks - handle LSTM vs flat state
+        if self.agent.lstm_enabled:
+            # LSTM mode: create sequence inputs
+            dummy_short = np.zeros((1, 10, self.STATE_DIM))
+            dummy_medium = np.zeros((1, 20, self.STATE_DIM))
+            dummy_long = np.zeros((1, 30, self.STATE_DIM))
+            self.agent.online_network(dummy_short, dummy_medium, dummy_long, training=False)
         self.agent.load("checkpoints/best")
+        self.agent.epsilon = 0.0  # live trading is always deterministic
 
-        print(f"✅ Agent loaded (epsilon: {self.agent.epsilon:.3f})")
+        print(f"✅ Agent loaded (deterministic mode, epsilon forced to 0)")
 
-        # Initialize feature calculator
+        # Initialize feature calculator — derive feature count like the environment does
         self.feature_calculator = TechnicalIndicators()
-        print("✅ Feature calculator initialized")
+        self._feature_names = self.feature_calculator.get_feature_names()
+        self._num_market_features = len(self._feature_names)
+        print(f"✅ Feature calculator initialized ({self._num_market_features} features per coin)")
 
-        # Initialize state builder
-        self.state_builder = StateBuilder(num_coins=20, num_features=186)
+        # Initialize state builder (num_features from TA config, matches environment.py)
+        self.state_builder = StateBuilder(num_coins=20, num_features=self._num_market_features)
+        print("✅ State builder initialized")
 
         # Initialize trade executor
         self.executor = TradeExecutor(
             client=self.client, leverage=10, position_size_pct=0.20, max_positions=3
         )
-        print("✅ Trade executor initialized")
+        # Sync any positions opened in a previous session so the in-memory cache
+        # is accurate from the start (close_all_positions iterates this cache).
+        n_synced = self.executor.sync_positions_from_binance()
+        if n_synced:
+            print(f"✅ Trade executor initialized — synced {n_synced} existing position(s) from Binance")
+        else:
+            print("✅ Trade executor initialized")
 
         # Initialize guardrails
         self.guardrails = GuardrailManager(
@@ -135,14 +155,22 @@ class TradingBot:
         self.max_positions = 3
         self.initial_balance = 0.0
 
-        # Initialize dashboard
-        self.dashboard = LiveTradingDashboard()
-        self.dashboard.update_config(
-            mode=self.trading_mode,
-            max_daily_loss=self.max_daily_loss,
-            max_daily_trades=self.max_daily_trades,
-            epsilon=self.agent.epsilon,
-        )
+        # Today's PnL baseline (resets at midnight, independent of session rescreening)
+        self._today_date: str = ""
+        self._today_initial_balance: float = 0.0
+
+        # LSTM state buffer — matches environment.state_buffer
+        self.lstm_enabled = self.agent.lstm_enabled
+        self.sequence_lengths = [10, 20, 30]
+        self.state_buffer: list = []
+
+        # Portfolio tracking for portfolio feature vector (mirrors PositionManager internals)
+        self._step_pnls: list = []       # realized PnL per closed trade (last 100)
+        self._peak_balance: float = 0.0  # for drawdown computation
+
+        # Win/loss counters (used for DB session logging)
+        self.winning_trades = 0
+        self.losing_trades = 0
 
         print("\n🤖 Bot initialized successfully!\n")
 
@@ -150,6 +178,156 @@ class TradingBot:
         """Log event to file."""
         if level == "ERROR":
             _log.error(message, extra=extra_data or {})
+
+    def _log_activity(self, message: str) -> None:
+        """Append a timestamped event to the rolling activity log."""
+        self._activity_log.append({
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "message": message,
+        })
+        if len(self._activity_log) > 50:
+            self._activity_log = self._activity_log[-50:]
+
+    def _write_metrics(
+        self,
+        step: int,
+        current_balance: float,
+        action_str: str = "",
+        avg_q: float = 0.0,
+        today_pnl: float = 0.0,
+    ) -> None:
+        """Write live bot state to live_trading_metrics.json for the web dashboard."""
+        try:
+            import json
+
+            positions = self._get_enriched_positions()
+            pos_list = [
+                {
+                    "symbol": sym,
+                    "side": pos["side"],
+                    "size": float(pos["size"]),
+                    "entry_price": float(pos["entry_price"]),
+                    "unrealized_pnl": float(pos.get("unrealized_pnl", 0.0)),
+                    "leverage": int(pos.get("leverage", 10)),
+                }
+                for sym, pos in positions.items()
+            ]
+
+            winning = self.winning_trades
+            losing = self.losing_trades
+            total = winning + losing
+            g_status = self.guardrails.get_status()
+
+            self._pnl_history.append({
+                "t": datetime.now().isoformat(),
+                "pnl": float(current_balance - self.initial_balance),
+            })
+            if len(self._pnl_history) > 300:
+                self._pnl_history = self._pnl_history[-300:]
+
+            # Build per-coin table for web dashboard
+            coin_table = []
+            try:
+                if self.current_coins and self._last_market_features:
+                    all_syms = (
+                        self.current_coins.get("gainers", [])
+                        + self.current_coins.get("losers", [])
+                    )
+                    q_vals = getattr(self.agent, "last_q_values", None)
+                    ta_cols = [
+                        "close", "rsi_14", "macd_histogram",
+                        "bb_pctb_20", "volume_ratio", "atr_14", "adx_14",
+                    ]
+                    gainers_pct = self.current_coins.get("gainers_pct", [])
+                    losers_pct = self.current_coins.get("losers_pct", [])
+                    for coin_idx, symbol in enumerate(all_syms[:20]):
+                        is_gainer = coin_idx < 10
+                        local_idx = coin_idx % 10
+                        # TA values
+                        ta: dict = {}
+                        df = self._last_market_features.get(symbol)
+                        if df is not None:
+                            for col in ta_cols:
+                                try:
+                                    val = float(df[col][-1]) if col in df.columns else None
+                                    ta[col] = None if (val is None or val != val) else round(val, 6)
+                                except Exception:
+                                    ta[col] = None
+                        # Q-values (masked actions return -1e9 from network)
+                        q_hold = q_long = q_short = q_close = None
+                        if q_vals is not None and len(q_vals) >= 63:
+                            q_hold = round(float(q_vals[0]), 3)  # HOLD always valid
+                            if is_gainer:
+                                rl, rs, rc = (
+                                    float(q_vals[1 + local_idx]),
+                                    float(q_vals[11 + local_idx]),
+                                    float(q_vals[21 + local_idx]),
+                                )
+                            else:
+                                rl, rs, rc = (
+                                    float(q_vals[31 + local_idx]),
+                                    float(q_vals[41 + local_idx]),
+                                    float(q_vals[51 + local_idx]),
+                                )
+                            q_long  = round(rl, 3) if rl  > -1e6 else None
+                            q_short = round(rs, 3) if rs  > -1e6 else None
+                            q_close = round(rc, 3) if rc  > -1e6 else None
+                        # 24h change %
+                        if is_gainer:
+                            pct = float(gainers_pct[coin_idx]) if coin_idx < len(gainers_pct) else 0.0
+                        else:
+                            pct = float(losers_pct[local_idx]) if local_idx < len(losers_pct) else 0.0
+                        coin_table.append({
+                            "symbol": symbol,
+                            "type": "gainer" if is_gainer else "loser",
+                            "rank": local_idx,
+                            "change_24h": round(pct, 2),
+                            "ta": ta,
+                            "q_hold": q_hold,
+                            "q_long": q_long,
+                            "q_short": q_short,
+                            "q_close": q_close,
+                        })
+            except Exception as e:
+                _log.warning(f"coin_table build failed: {e}")
+
+            data = {
+                "status": "running",
+                "session_started": self._session_started,
+                "current_balance": float(current_balance),
+                "initial_balance": float(self.initial_balance),
+                "total_pnl": float(current_balance - self.initial_balance),
+                "today_pnl": float(today_pnl),
+                "win_rate": winning / total if total > 0 else 0.0,
+                "trade_count": self.daily_trades,
+                "current_positions": pos_list,
+                "recent_trades": [],
+                "agent_status": "active",
+                "epsilon": float(self.agent.epsilon),
+                "current_step": step,
+                "last_action": action_str,
+                "avg_q": float(avg_q),
+                "screened_coins": self.current_coins,
+                "guardrail_status": {
+                    "cooldown_remaining": int(g_status["cooldown_remaining"]),
+                    "daily_trades": self.daily_trades,
+                    "daily_pnl": float(current_balance - self.initial_balance),
+                },
+                "activity_log": list(reversed(self._activity_log)),
+                "pnl_history": list(self._pnl_history),
+                "coin_table": coin_table,
+                "trading_mode": self.trading_mode,
+                "last_updated": datetime.now().isoformat(),
+            }
+
+            log_dir = Path("logs/trading")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            tmp = log_dir / "live_trading_metrics.tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            tmp.rename(log_dir / "live_trading_metrics.json")
+        except Exception as e:
+            _log.error(f"_write_metrics failed: {e}")
 
     def _retry(
         self, fn, *args, retries: int = 3, delay: float = 5.0, label: str = "", **kwargs
@@ -176,8 +354,6 @@ class TradingBot:
                     f"{label or fn.__name__} failed (attempt {attempt}/{retries}): {e}"
                 )
                 _log.error(msg)
-                self.dashboard.last_error = msg
-                self.dashboard.error_count += 1
                 if attempt < retries:
                     # Exponential backoff: 5s, 10s, 20s
                     wait = delay * (2 ** (attempt - 1))
@@ -252,7 +428,8 @@ class TradingBot:
                 result = self.executor.open_long(symbol, balance)
                 if result:
                     self.guardrails.record_position_opened(symbol)
-                return symbol, "LONG", 0.0
+                    return symbol, "LONG", 0.0
+                return "", "", 0.0
 
             case n if 11 <= n <= 20:
                 symbol = self.current_coins["gainers"][n - 11]
@@ -264,7 +441,8 @@ class TradingBot:
                 result = self.executor.open_short(symbol, balance)
                 if result:
                     self.guardrails.record_position_opened(symbol)
-                return symbol, "SHORT", 0.0
+                    return symbol, "SHORT", 0.0
+                return "", "", 0.0
 
             case n if 21 <= n <= 30:
                 symbol = self.current_coins["gainers"][n - 21]
@@ -288,7 +466,8 @@ class TradingBot:
                 result = self.executor.open_long(symbol, balance)
                 if result:
                     self.guardrails.record_position_opened(symbol)
-                return symbol, "LONG", 0.0
+                    return symbol, "LONG", 0.0
+                return "", "", 0.0
 
             case n if 41 <= n <= 50:
                 symbol = self.current_coins["losers"][n - 41]
@@ -300,7 +479,8 @@ class TradingBot:
                 result = self.executor.open_short(symbol, balance)
                 if result:
                     self.guardrails.record_position_opened(symbol)
-                return symbol, "SHORT", 0.0
+                    return symbol, "SHORT", 0.0
+                return "", "", 0.0
 
             case n if 51 <= n <= 60:
                 symbol = self.current_coins["losers"][n - 51]
@@ -327,107 +507,103 @@ class TradingBot:
             case _:
                 return "", "", 0.0
 
-    def _build_state(self, market_features: dict, current_balance: float) -> np.ndarray:
-        """Build state vector that matches training environment exactly."""
+    def _build_state(
+        self,
+        market_features: dict,
+        current_balance: float,
+        step: int = 0,
+        pnl_today: float = 0.0,
+    ) -> np.ndarray:
+        """Build state vector matching training environment exactly."""
         initial_balance = 10000.0  # Must match training config
         max_positions = 3
 
-        # --- Market Features ---
-        market_features_dict = {}
         all_symbols = self.current_coins["gainers"] + self.current_coins["losers"]
 
+        # --- Market Features (20 × num_features) ---
+        # Use the same feature column list as the environment (_get_market_features)
+        market_features_dict = {}
         for coin_idx, symbol in enumerate(all_symbols):
             if symbol in market_features:
                 df = market_features[symbol]
-                feature_cols = [
-                    col
-                    for col in df.columns
-                    if col
-                    not in ["timestamp", "open", "high", "low", "close", "volume"]
+                values = [
+                    float(df[col][-1]) if col in df.columns else 0.0
+                    for col in self._feature_names
                 ]
-                latest_features = df.select(feature_cols).row(-1)
-                market_features_dict[coin_idx] = np.array(
-                    latest_features, dtype=np.float32
-                )
+                market_features_dict[coin_idx] = np.array(values, dtype=np.float32)
 
-        # --- Position Features - MATCHES position_manager.get_position_features() ---
-        position_features = np.zeros((20, 6), dtype=np.float32)
+        # --- Position Features (20, 8) — matches PositionManager.get_position_features() ---
+        position_features = np.zeros((20, 8), dtype=np.float32)
         positions = self.executor.get_position_info()["positions"]
+        total_portfolio = max(current_balance, 1.0)
 
         for coin_idx, symbol in enumerate(all_symbols):
             if symbol in positions:
                 pos = positions[symbol]
                 current_price = self.executor.get_current_price(symbol)
                 entry = pos["entry_price"]
-                size = pos["size"] * entry  # Convert quantity to USDT value
+                size_usdt = pos["size"] * entry
 
                 if pos["side"] == "LONG":
-                    unrealized_pnl = (current_price - entry) / entry * size
+                    unrealized_pnl = (current_price - entry) / entry * size_usdt
                 else:
-                    unrealized_pnl = (entry - current_price) / entry * size
+                    unrealized_pnl = (entry - current_price) / entry * size_usdt
 
-                holding_time = self.guardrails.position_history.get(symbol, {}).get(
+                opened_step = self.guardrails.position_history.get(symbol, {}).get(
                     "opened_step", self.guardrails.current_step
                 )
-                steps_held = self.guardrails.current_step - holding_time
+                steps_held = self.guardrails.current_step - opened_step
 
                 position_features[coin_idx, 0] = 1.0
                 position_features[coin_idx, 1] = 1.0 if pos["side"] == "LONG" else -1.0
-                position_features[coin_idx, 2] = size / initial_balance
-                position_features[coin_idx, 3] = (
-                    unrealized_pnl / size if size > 0 else 0.0
-                )
-                position_features[coin_idx, 4] = (
-                    (current_price - entry) / entry if entry > 0 else 0.0
-                )
+                position_features[coin_idx, 2] = size_usdt / initial_balance
+                position_features[coin_idx, 3] = unrealized_pnl / size_usdt if size_usdt > 0 else 0.0
+                position_features[coin_idx, 4] = (current_price - entry) / entry if entry > 0 else 0.0
                 position_features[coin_idx, 5] = min(steps_held / 88.0, 1.0)
+                position_features[coin_idx, 6] = min(steps_held / 288.0, 1.0)   # [6] hold_duration/day
+                position_features[coin_idx, 7] = size_usdt / total_portfolio      # [7] size_fraction
 
-        # --- Portfolio Features - MATCHES position_manager.get_portfolio_features() ---
+        # --- Portfolio Features (8,) — matches PositionManager.get_portfolio_features() ---
         num_positions = len(positions)
-        total_unrealized = (
-            sum(
-                (
-                    (self.executor.get_current_price(sym) - pos["entry_price"])
-                    / pos["entry_price"]
-                    * pos["size"]
-                    * pos["entry_price"]
-                    if pos["side"] == "LONG"
-                    else (pos["entry_price"] - self.executor.get_current_price(sym))
-                    / pos["entry_price"]
-                    * pos["size"]
-                    * pos["entry_price"]
-                )
-                for sym, pos in positions.items()
+        total_unrealized = sum(
+            (
+                (self.executor.get_current_price(sym) - pos["entry_price"])
+                / pos["entry_price"]
+                * pos["size"]
+                * pos["entry_price"]
+                if pos["side"] == "LONG"
+                else (pos["entry_price"] - self.executor.get_current_price(sym))
+                / pos["entry_price"]
+                * pos["size"]
+                * pos["entry_price"]
             )
-            if positions
-            else 0.0
-        )
+            for sym, pos in positions.items()
+        ) if positions else 0.0
 
-        portfolio_features = np.array(
-            [
-                current_balance / initial_balance,
-                current_balance / initial_balance,
-                num_positions / max_positions,
-                total_unrealized / initial_balance,
-                num_positions / max_positions,
-            ],
-            dtype=np.float32,
-        )
+        if len(self._step_pnls) >= 3:
+            pnls_arr = np.array(self._step_pnls[-20:])
+            rolling_sharpe = float(np.clip(np.mean(pnls_arr) / (np.std(pnls_arr) + 1e-8), -3.0, 3.0))
+            port_vol = float(np.clip(np.std(pnls_arr) / initial_balance, 0.0, 1.0))
+        else:
+            rolling_sharpe = 0.0
+            port_vol = 0.0
 
-        # --- Time Features - MATCHES environment._build_state() ---
-        # Training: candles_per_day=288, warmup=200 -> 88 tradeable steps
-        total_steps = 88
-        current_relative_step = min(self.guardrails.current_step, total_steps)
+        drawdown = float(np.clip(
+            (self._peak_balance - current_balance) / max(self._peak_balance, 1.0), 0.0, 1.0
+        )) if self._peak_balance > 0 else 0.0
 
-        time_array = np.array(
-            [
-                current_relative_step / total_steps,
-                1.0 - (current_relative_step / total_steps),
-            ],
-            dtype=np.float32,
-        )
+        portfolio_features = np.array([
+            current_balance / initial_balance,   # [0] portfolio value
+            current_balance / initial_balance,   # [1] cash (approx — no separate tracking)
+            num_positions / max_positions,        # [2] slots used
+            total_unrealized / initial_balance,   # [3] total unrealized PnL
+            0.0,                                  # [4] fees (not tracked separately live)
+            rolling_sharpe,                       # [5] rolling Sharpe
+            drawdown,                             # [6] max drawdown pct
+            port_vol,                             # [7] portfolio volatility
+        ], dtype=np.float32)
 
-        # --- Coin Metadata ---
+        # --- Coin Metadata (20 × 6) ---
         coin_metadata = {}
         for coin_idx in range(20):
             is_gainer = coin_idx < 10
@@ -443,11 +619,23 @@ class TradingBot:
                 "daily_change": daily_change,
             }
 
+        # --- Regime Features (8,) — computed from live market data ---
+        regime_features = self._compute_regime_features(market_features, step)
+
+        # --- Guardrail Features (5,) — current constraint state ---
+        guardrail_features = self._compute_guardrail_features(current_balance, pnl_today)
+
+        # --- Time (candles_per_day=288, warmup=0) ---
+        total_steps = 288
+        current_relative_step = min(step, total_steps)
+
         return self.state_builder.build_state(
             market_features=market_features_dict,
             position_features=position_features,
             portfolio_features=portfolio_features,
             coin_metadata=coin_metadata,
+            regime_features=regime_features,
+            guardrail_features=guardrail_features,
             current_step=current_relative_step,
             total_steps=total_steps,
         )
@@ -467,330 +655,553 @@ class TradingBot:
             enriched[sym] = {**pos, "unrealized_pnl": upnl}
         return enriched
 
-    def _wait_for_next_interval(self, live, reason: str = ""):
-        """Sit out the rest of the current 5-minute interval, updating dashboard each second."""
+    def _compute_regime_features(self, market_features: dict, step: int) -> np.ndarray:
+        """
+        Compute 8 regime features from live market data.
+        Mirrors environment._compute_regime_features() but driven by live DataFrames
+        (symbol → polars DataFrame with all TA columns) instead of episode_data.
+        """
+        vol_lb = 24  # volatility lookback candles (matches config regime.volatility_lookback)
+
+        all_returns: list = []
+        all_adx: list = []
+        step_returns: list = []
+
+        for df in market_features.values():
+            n_rows = len(df)
+            if n_rows < 2:
+                continue
+
+            closes = df["close"].to_numpy().astype(np.float64)
+
+            # Rolling vol: last vol_lb candles
+            start = max(0, n_rows - vol_lb)
+            window_closes = closes[start:]
+            if len(window_closes) >= 2:
+                rets = np.diff(np.log(window_closes + 1e-8))
+                all_returns.extend(rets.tolist())
+
+            # ADX from latest row
+            if "adx_14" in df.columns:
+                adx_val = float(df["adx_14"][-1])
+                if not np.isnan(adx_val):
+                    all_adx.append(adx_val / 100.0)
+
+            # Step return (last candle vs previous)
+            if n_rows >= 2:
+                step_returns.append(float(closes[-1]) / float(closes[-2]) - 1)
+
+        all_returns_arr = np.array(all_returns) if all_returns else np.array([0.0])
+
+        # 1. Average ADX (trend strength)
+        avg_adx = float(np.mean(all_adx)) if all_adx else 0.0
+
+        # 2. Realized volatility, normalized vs typical 0.005 per 5m candle
+        realized_vol = float(np.std(all_returns_arr)) if len(all_returns_arr) > 1 else 0.0
+        vol_normalized = float(np.clip(realized_vol / 0.005, 0, 5) / 5.0)
+
+        # 3. Market breadth — fraction of coins with positive step return
+        breadth = float(np.mean([r > 0 for r in step_returns])) if step_returns else 0.5
+
+        # 4. Average absolute return this step (session heat)
+        avg_abs_return = float(np.clip(
+            np.mean(np.abs(step_returns)) / 0.02, 0, 1
+        )) if step_returns else 0.0
+
+        # 5. Trend consistency — fraction of returns matching overall direction
+        overall_sign = np.sign(np.mean(all_returns_arr)) if len(all_returns_arr) > 0 else 0
+        consistency = float(np.mean(
+            np.sign(all_returns_arr) == overall_sign
+        )) if len(all_returns_arr) > 0 else 0.5
+
+        # 6. Vol ratio: recent window vs full-history vol
+        full_returns: list = []
+        for df in market_features.values():
+            closes = df["close"].to_numpy().astype(np.float64)
+            if len(closes) >= 2:
+                full_returns.extend(np.diff(np.log(closes + 1e-8)).tolist())
+        full_vol = float(np.std(full_returns)) if len(full_returns) > 1 else realized_vol
+        vol_ratio = float(np.clip(realized_vol / (full_vol + 1e-8), 0, 3) / 3.0)
+
+        # 7. Intraday momentum persistence (early-move retention)
+        persistence = 0.5
+        if market_features:
+            df = next(iter(market_features.values()))
+            n_rows = len(df)
+            closes = df["close"].to_numpy().astype(np.float64)
+            check_step = 30
+            if n_rows > check_step + 1:
+                early_move = closes[check_step] / (closes[0] + 1e-8) - 1
+                recent_move = closes[-1] / (closes[0] + 1e-8) - 1
+                if abs(early_move) > 1e-8:
+                    persistence = float(np.clip(recent_move / early_move, -1, 2) / 2.0 + 0.5)
+
+        # 8. Fraction of trading day elapsed
+        day_progress = float(np.clip(step / 288.0, 0.0, 1.0))
+
+        return np.array([
+            avg_adx, vol_normalized, breadth, avg_abs_return,
+            consistency, vol_ratio, float(np.clip(persistence, 0, 1)), day_progress,
+        ], dtype=np.float32)
+
+    def _compute_guardrail_features(
+        self, current_balance: float, pnl_today: float
+    ) -> np.ndarray:
+        """
+        Compute 5 guardrail state features.
+        Mirrors environment._compute_guardrail_features() using live GuardrailManager state.
+        """
+        status = self.guardrails.get_status()
+        cooldown_remaining = status["cooldown_remaining"]
+        position_ages = status["position_ages"]  # {symbol: steps_held}
+
+        positions = self.executor.get_position_info()["positions"]
+        num_positions = len(positions)
+
+        # 1. Cooldown remaining (normalized)
+        cooldown_norm = cooldown_remaining / max(self.guardrails.cooldown_steps, 1)
+
+        # 2. Average hold remaining across open positions (normalized)
+        if positions:
+            holds_remaining = [
+                max(0, self.guardrails.min_hold_steps - position_ages.get(sym, self.guardrails.min_hold_steps))
+                for sym in positions
+            ]
+            avg_hold_remaining = float(np.mean(holds_remaining)) / max(self.guardrails.min_hold_steps, 1)
+        else:
+            avg_hold_remaining = 0.0
+
+        # 3. Position slots used
+        slots_used = num_positions / max(self.max_positions, 1)
+
+        # 4. Daily trades used
+        trades_norm = self.daily_trades / max(self.max_daily_trades, 1)
+
+        # 5. Daily loss used (negative pnl_today / max loss)
+        loss_norm = float(np.clip(max(0.0, -pnl_today) / max(self.max_daily_loss, 1.0), 0.0, 1.0))
+
+        return np.array([
+            float(np.clip(cooldown_norm,      0, 1)),
+            float(np.clip(avg_hold_remaining, 0, 1)),
+            float(np.clip(slots_used,         0, 1)),
+            float(np.clip(trades_norm,        0, 1)),
+            float(np.clip(loss_norm,          0, 1)),
+        ], dtype=np.float32)
+
+    def _build_action_mask(self) -> np.ndarray:
+        """
+        Build a (63,) boolean action mask matching environment.get_action_mask()
+        with num_coins_per_side=10, num_sizes=1.
+
+        Action layout (n=10, s=1):
+          0      : HOLD
+          1-10   : LONG  gainer[0-9]
+          11-20  : SHORT gainer[0-9]
+          21-30  : CLOSE gainer[0-9]
+          31-40  : LONG  loser[0-9]
+          41-50  : SHORT loser[0-9]
+          51-60  : CLOSE loser[0-9]
+          61     : CLOSE_ALL
+          62     : CLOSE_WORST
+        """
+        n = 10
+        mask = np.zeros(self.ACTION_DIM, dtype=bool)
+        mask[0] = True  # HOLD always valid
+
+        positions = self.executor.get_position_info()["positions"]
+        num_positions = len(positions)
+        status = self.guardrails.get_status()
+        cooldown_remaining = status["cooldown_remaining"]
+        position_ages = status["position_ages"]  # {symbol: steps_held}
+
+        # Circuit breaker: if daily loss >= max, only HOLD/CLOSE allowed
+        pnl_today = (self.current_balance or 0.0) - self.initial_balance
+        circuit_breaker = (self.initial_balance > 0) and (-pnl_today >= self.max_daily_loss)
+        trade_limit_hit = self.daily_trades >= self.max_daily_trades
+
+        can_open = (
+            not circuit_breaker
+            and not trade_limit_hit
+            and num_positions < self.max_positions
+            and cooldown_remaining == 0
+        )
+
+        all_symbols = self.current_coins["gainers"] + self.current_coins["losers"]
+
+        for coin_idx, symbol in enumerate(all_symbols):
+            is_gainer = coin_idx < n
+            local_idx = coin_idx % n
+
+            # Open actions
+            if can_open and symbol not in positions:
+                if is_gainer:
+                    mask[1 + local_idx] = True   # LONG gainer
+                    mask[11 + local_idx] = True  # SHORT gainer
+                else:
+                    mask[31 + local_idx] = True  # LONG loser
+                    mask[41 + local_idx] = True  # SHORT loser
+
+            # Close actions — only if min hold satisfied
+            if symbol in positions:
+                steps_held = position_ages.get(symbol, self.guardrails.min_hold_steps)
+                if steps_held >= self.guardrails.min_hold_steps:
+                    if is_gainer:
+                        mask[21 + local_idx] = True  # CLOSE gainer
+                    else:
+                        mask[51 + local_idx] = True  # CLOSE loser
+
+        # CLOSE_ALL (61) and CLOSE_WORST (62)
+        has_closable = any(
+            position_ages.get(sym, self.guardrails.min_hold_steps) >= self.guardrails.min_hold_steps
+            for sym in positions
+        )
+        if has_closable:
+            mask[61] = True
+            mask[62] = True
+
+        return mask
+
+    def _wait_for_next_interval(self, reason: str = ""):
+        """Sit out the rest of the current 5-minute interval."""
+        if reason:
+            _log.info(f"Waiting for next interval: {reason}")
         now = datetime.now()
         seconds_into_interval = (now.minute % 5) * 60 + now.second
         seconds_to_wait = max(300 - seconds_into_interval, 10)
-        next_interval = now + timedelta(seconds=seconds_to_wait)
-        self.dashboard.update_step(self.dashboard.current_step, next_interval)
-        for remaining in range(seconds_to_wait, 0, -1):
-            self.dashboard.update_countdown(remaining)
-            live.update(self.dashboard.generate_dashboard())
-            time.sleep(1)
+        time.sleep(seconds_to_wait)
 
     def run(self):
-        """Main trading loop with live dashboard."""
+        """Main trading loop."""
         # Ensure logs directory exists
         Path("logs").mkdir(exist_ok=True)
 
         last_screening_time = None
         step = 0
 
-        with Live(
-            self.dashboard.generate_dashboard(),
-            console=self.dashboard.console,
-            refresh_per_second=2,
-            screen=True,
-        ) as live:
-            self.dashboard.start_keyboard_listener()
-            while True:
-                try:
-                    current_date = datetime.now().date()
-                    current_hour = datetime.now().hour
+        while True:
+            try:
+                current_date = datetime.now().date()
+                current_hour = datetime.now().hour
 
-                    # -- Morning Screening -----------------------------------------
-                    now = datetime.now()
-                    is_7am_window = current_hour == 7
-                    already_screened_this_hour = (
-                        last_screening_time is not None
-                        and now - last_screening_time < timedelta(hours=1)
-                    )
-                    should_screen = last_screening_time is None or (
-                        is_7am_window and not already_screened_this_hour
-                    )
+                # -- Morning Screening -----------------------------------------
+                now = datetime.now()
+                is_7am_window = current_hour == 7
+                already_screened_this_hour = (
+                    last_screening_time is not None
+                    and now - last_screening_time < timedelta(hours=1)
+                )
+                should_screen = last_screening_time is None or (
+                    is_7am_window and not already_screened_this_hour
+                )
 
-                    if should_screen:
-                        # Close all before re-screening (not first run)
-                        if last_screening_time is not None:
-                            self.executor.close_all_positions()
-                            for sym in list(self.guardrails.position_history.keys()):
-                                self.guardrails.record_position_closed(sym)
+                if should_screen:
+                    # Close all before re-screening (not first run)
+                    if last_screening_time is not None:
+                        self.executor.close_all_positions()
+                        for sym in list(self.guardrails.position_history.keys()):
+                            self.guardrails.record_position_closed(sym)
 
-                        # Screen top movers -- retry 3x, keep old list if all attempts fail
-                        try:
-                            new_coins = self._retry(
-                                get_top_movers,
-                                self.client,
-                                retries=3,
-                                delay=10.0,
-                                label="Screening",
-                            )
-                            self.current_coins = new_coins
-                        except Exception:
-                            # If first run and screening fails, can't trade -- wait and retry
-                            if self.current_coins is None:
-                                self._wait_for_next_interval(
-                                    live, "Screening failed -- retrying"
-                                )
-                                continue
-                            # Otherwise keep yesterday's list and log it
-                            _log.error(
-                                "Screening failed after 3 attempts -- keeping previous coin list"
-                            )
-
-                        # Reset counters
-                        self.daily_trades = 0
-                        self.daily_pnl = 0.0
-                        self.guardrails.reset_daily()
-
-                        # Get initial balance with retry
-                        try:
-                            self.initial_balance = self._retry(
-                                self.executor.get_balance,
-                                retries=3,
-                                delay=5.0,
-                                label="get_balance (screening)",
-                            )
-                        except Exception:
-                            self._wait_for_next_interval(live, "Balance fetch failed")
-                            continue
-
-                        # Push to dashboard
-                        self.dashboard.update_screening(self.current_coins)
-                        self.dashboard.update_portfolio(
-                            self.initial_balance, self.initial_balance, 0.0
-                        )
-                        self.dashboard.winning_trades = 0
-                        self.dashboard.losing_trades = 0
-
-                        # Close previous session in DB (if not first run)
-                        if self.current_session_key:
-                            self.logger.close_session(
-                                self.current_session_key,
-                                final_balance=self.initial_balance,
-                                total_pnl=self.daily_pnl,
-                                total_trades=self.daily_trades,
-                                winning_trades=self.dashboard.winning_trades,
-                                losing_trades=self.dashboard.losing_trades,
-                            )
-
-                        # Open new session in DB
-                        self.current_session_key = self.logger.open_session(
-                            mode=self.trading_mode,
-                            initial_balance=self.initial_balance,
-                            screened_coins=self.current_coins,
-                        )
-                        self.open_trade_keys = {}
-
-                        last_screening_time = now
-                        step = 0
-
-                    # -- Step ------------------------------------------------------
-                    step += 1
-                    self.guardrails.step()
-
-                    # Get balance -- if this fails after retries, skip the whole step
+                    # Screen top movers -- retry 3x, keep old list if all attempts fail
                     try:
-                        current_balance = self._retry(
+                        new_coins = self._retry(
+                            get_top_movers,
+                            self.client,
+                            retries=3,
+                            delay=10.0,
+                            label="Screening",
+                        )
+                        self.current_coins = new_coins
+                    except Exception:
+                        # If first run and screening fails, can't trade -- wait and retry
+                        if self.current_coins is None:
+                            self._wait_for_next_interval("Screening failed -- retrying")
+                            continue
+                        # Otherwise keep yesterday's list and log it
+                        _log.error(
+                            "Screening failed after 3 attempts -- keeping previous coin list"
+                        )
+
+                    # Reset counters
+                    self.daily_trades = 0
+                    self.daily_pnl = 0.0
+                    self.guardrails.reset_daily()
+                    self._step_pnls = []
+                    self._peak_balance = 0.0
+                    self.state_buffer = []
+                    self._pnl_history = []
+                    self.winning_trades = 0
+                    self.losing_trades = 0
+
+                    # Get initial balance with retry
+                    try:
+                        self.initial_balance = self._retry(
                             self.executor.get_balance,
                             retries=3,
                             delay=5.0,
-                            label="get_balance",
+                            label="get_balance (screening)",
                         )
                     except Exception:
-                        self._wait_for_next_interval(
-                            live, "Balance fetch failed -- skipping step"
+                        self._wait_for_next_interval("Balance fetch failed")
+                        continue
+
+                    # Close previous session in DB (if not first run)
+                    if self.current_session_key:
+                        self.logger.close_session(
+                            self.current_session_key,
+                            final_balance=self.initial_balance,
+                            total_pnl=self.daily_pnl,
+                            total_trades=self.daily_trades,
+                            winning_trades=self.winning_trades,
+                            losing_trades=self.losing_trades,
                         )
-                        continue
 
-                    pnl_today = current_balance - self.initial_balance
-
-                    self.dashboard.update_portfolio(
-                        current_balance, self.initial_balance, pnl_today
+                    # Open new session in DB
+                    self.current_session_key = self.logger.open_session(
+                        mode=self.trading_mode,
+                        initial_balance=self.initial_balance,
+                        screened_coins=self.current_coins,
                     )
-                    self.dashboard.update_step(step, datetime.now())
-                    guardrail_status = self.guardrails.get_status()
-                    self.dashboard.update_guardrails(
-                        guardrail_status["current_step"],
-                        guardrail_status["cooldown_remaining"],
-                    )
-                    live.update(self.dashboard.generate_dashboard())
+                    self.open_trade_keys = {}
+                    self._session_started = datetime.now().isoformat()
 
-                    # -- Daily Loss Limit ------------------------------------------
-                    if pnl_today <= -self.max_daily_loss:
-                        self.executor.close_all_positions()
-                        # Wait until next 7 AM
-                        while True:
-                            time.sleep(300)
-                            if datetime.now().hour == 7 and (
-                                last_screening_time is None
-                                or datetime.now() - last_screening_time
-                                > timedelta(hours=1)
-                            ):
-                                break
-                        continue
+                    last_screening_time = now
+                    step = 0
 
-                    # -- Market Data -----------------------------------------------
-                    all_symbols = (
-                        self.current_coins["gainers"] + self.current_coins["losers"]
+                    gainers_str = " ".join(self.current_coins["gainers"][:10])
+                    losers_str = " ".join(self.current_coins["losers"][:10])
+                    self._log_activity(
+                        f"Screened — gainers: {gainers_str} | losers: {losers_str}"
                     )
+                    self._write_metrics(0, self.initial_balance, "Screened")
+
+                # -- Step ------------------------------------------------------
+                step += 1
+                self.guardrails.step()
+
+                # Signal the dashboard that we are working on this step
+                self._write_metrics(step, self.initial_balance, f"Step {step}: fetching data…")
+
+                # Get equity (wallet + unrealized) for each step.
+                # initial_balance uses get_balance() (wallet only) so that
+                # session_pnl = equity_now - wallet_at_start = unrealized + closed_trade_pnl
+                try:
+                    current_balance = self._retry(
+                        self.executor.get_equity,
+                        retries=3,
+                        delay=5.0,
+                        label="get_equity",
+                    )
+                except Exception:
+                    self._wait_for_next_interval("Balance fetch failed -- skipping step")
+                    continue
+
+                self.current_balance = current_balance  # keep instance var in sync for _build_action_mask
+                pnl_today = current_balance - self.initial_balance
+
+                # Today's PnL: resets at midnight using same wallet baseline as session.
+                # _today_initial_balance holds wallet at start-of-day (not equity),
+                # so today_pnl = equity_now - wallet_at_day_start = unrealized + realized.
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                if today_str != self._today_date:
+                    self._today_date = today_str
+                    # Use wallet baseline (initial_balance was set from get_balance/wallet)
+                    self._today_initial_balance = self.initial_balance
+                today_pnl = current_balance - self._today_initial_balance
+
+                # Track peak balance for drawdown computation
+                if self._peak_balance <= 0:
+                    self._peak_balance = current_balance
+                else:
+                    self._peak_balance = max(self._peak_balance, current_balance)
+
+                # -- Daily Loss Limit ------------------------------------------
+                if pnl_today <= -self.max_daily_loss:
+                    self.executor.close_all_positions()
+                    # Wait until next 7 AM
+                    while True:
+                        time.sleep(300)
+                        if datetime.now().hour == 7 and (
+                            last_screening_time is None
+                            or datetime.now() - last_screening_time
+                            > timedelta(hours=1)
+                        ):
+                            break
+                    continue
+
+                # -- Market Data -----------------------------------------------
+                all_symbols = (
+                    self.current_coins["gainers"] + self.current_coins["losers"]
+                )
+                try:
+                    market_data = self._retry(
+                        fetch_all_coins,
+                        self.client,
+                        all_symbols,
+                        interval="5m",
+                        limit=300,
+                        retries=3,
+                        delay=5.0,
+                        label="fetch_all_coins",
+                    )
+                except Exception:
+                    # Can't trade without market data -- HOLD this step
+                    self._wait_for_next_interval("Market data fetch failed -- HOLD")
+                    continue
+
+                # -- Features --------------------------------------------------
+                market_features = {}
+                for symbol, df in market_data.items():
                     try:
-                        market_data = self._retry(
-                            fetch_all_coins,
-                            self.client,
-                            all_symbols,
-                            interval="5m",
-                            limit=300,
-                            retries=3,
-                            delay=5.0,
-                            label="fetch_all_coins",
+                        market_features[symbol] = self.feature_calculator.calculate(
+                            df
                         )
-                    except Exception:
-                        # Can't trade without market data -- HOLD this step
-                        self._wait_for_next_interval(
-                            live, "Market data fetch failed -- HOLD"
-                        )
-                        continue
-
-                    # -- Features --------------------------------------------------
-                    market_features = {}
-                    for symbol, df in market_data.items():
-                        try:
-                            market_features[symbol] = self.feature_calculator.calculate(
-                                df
-                            )
-                        except Exception as e:
-                            # One bad coin doesn't stop the rest
-                            _log.error(f"Feature calculation failed for {symbol}: {e}")
-
-                    # -- Build State -----------------------------------------------
-                    try:
-                        state = self._build_state(market_features, current_balance)
                     except Exception as e:
-                        _log.error(f"State build failed: {e}")
-                        self.dashboard.last_error = f"State build failed: {e}"
-                        self.dashboard.error_count += 1
-                        self._wait_for_next_interval(live, "State build failed -- HOLD")
-                        continue
+                        # One bad coin doesn't stop the rest
+                        _log.error(f"Feature calculation failed for {symbol}: {e}")
+                self._last_market_features = market_features
 
-                    # -- Agent Decision --------------------------------------------
-                    action = self.agent.select_action(state, training=False)
-                    action_str = self._decode_action(action)
-
-                    avg_q = float(getattr(self.agent, "last_avg_q", 0.0))
-                    max_q = float(getattr(self.agent, "last_max_q", 0.0))
-                    self.dashboard.update_agent(action, action_str, avg_q, max_q)
-                    live.update(self.dashboard.generate_dashboard())
-
-                    # -- Execute Trade ---------------------------------------------
-                    old_count = self.executor.get_position_info()["count"]
-                    try:
-                        trade_symbol, trade_side, trade_pnl = self._execute_action(
-                            action
-                        )
-                    except Exception as e:
-                        # Order failed -- log it but don't crash the bot
-                        _log.error(f"Trade execution failed: {e}")
-                        self.dashboard.last_error = f"Order failed: {e}"
-                        self.dashboard.error_count += 1
-                        trade_symbol, trade_side, trade_pnl = "", "", 0.0
-
-                    new_count = self.executor.get_position_info()["count"]
-
-                    if trade_symbol and new_count != old_count:
-                        self.daily_trades += 1
-                        self.dashboard.record_trade(
-                            trade_symbol, trade_side, trade_pnl, action_str
-                        )
-
-                        # -- DB logging ------------------------------------------
-                        if new_count > old_count:
-                            # Position opened: fetch fill details from executor
-                            try:
-                                pos = self.executor.get_position_info()[
-                                    "positions"
-                                ].get(trade_symbol, {})
-                                all_symbols = (
-                                    self.current_coins["gainers"]
-                                    + self.current_coins["losers"]
-                                )
-                                coin_rank = (
-                                    all_symbols.index(trade_symbol)
-                                    if trade_symbol in all_symbols
-                                    else 0
-                                )
-                                is_gainer = coin_rank < 10
-                                trade_key = self.logger.log_trade_open(
-                                    session_key=self.current_session_key,
-                                    symbol=trade_symbol,
-                                    side=trade_side,
-                                    action_id=action,
-                                    entry_price=pos.get("entry_price", 0.0),
-                                    quantity=pos.get("size", 0.0),
-                                    portfolio_value=current_balance,
-                                    open_positions=new_count,
-                                    avg_q=avg_q,
-                                    coin_rank=coin_rank,
-                                    is_gainer=is_gainer,
-                                )
-                                self.open_trade_keys[trade_symbol] = trade_key
-                            except Exception as e:
-                                _log.error(f"DB log_trade_open failed: {e}")
-
-                        elif new_count < old_count:
-                            # Position closed: update the open trade row
-                            try:
-                                trade_key = self.open_trade_keys.pop(trade_symbol, None)
-                                exit_price = self._last_close_exit_prices.pop(
-                                    trade_symbol, 0.0
-                                )
-                                if trade_key:
-                                    self.logger.log_trade_close(
-                                        trade_key=trade_key,
-                                        exit_price=exit_price,
-                                        pnl=trade_pnl,
-                                        pnl_percent=(
-                                            (trade_pnl / current_balance * 100)
-                                            if current_balance > 0
-                                            else 0.0
-                                        ),
-                                    )
-                            except Exception as e:
-                                _log.error(f"DB log_trade_close failed: {e}")
-
-                    # Update positions display
-                    self.dashboard.update_positions(self._get_enriched_positions())
-                    self.dashboard.daily_trades = self.daily_trades
-                    live.update(self.dashboard.generate_dashboard())
-
-                    # -- Countdown -------------------------------------------------
-                    now = datetime.now()
-                    seconds_into_interval = (now.minute % 5) * 60 + now.second
-                    seconds_to_wait = 300 - seconds_into_interval
-                    next_interval = now + timedelta(seconds=seconds_to_wait)
-                    self.dashboard.update_step(step, next_interval)
-
-                    for remaining in range(seconds_to_wait, 0, -1):
-                        self.dashboard.update_countdown(remaining)
-                        live.update(self.dashboard.generate_dashboard())
-                        time.sleep(1)
-
-                except KeyboardInterrupt:
-                    raise  # Propagate so outer handler can clean up
-
+                # -- Build State -----------------------------------------------
+                try:
+                    state = self._build_state(
+                        market_features, current_balance, step, pnl_today
+                    )
                 except Exception as e:
-                    # Unexpected error -- log it, wait out the interval, then continue
-                    import traceback
+                    _log.error(f"State build failed: {e}")
+                    self._wait_for_next_interval("State build failed -- HOLD")
+                    continue
 
-                    _log.error(f"Unexpected loop error: {e}\n{traceback.format_exc()}")
-                    self.dashboard.last_error = f"Loop error: {e}"
-                    self.dashboard.error_count += 1
-                    live.update(self.dashboard.generate_dashboard())
-                    self._wait_for_next_interval(live, "Recovering from error")
+                # Update LSTM state buffer (rolling window of last 30 flat states)
+                self.state_buffer.append(state)
+                if len(self.state_buffer) > self.sequence_lengths[-1]:
+                    self.state_buffer = self.state_buffer[-self.sequence_lengths[-1]:]
 
-        # -- Cleanup (after Live context exits) ------------------------------------
-        self.dashboard.stop_keyboard_listener()
+                # -- Action Mask -----------------------------------------------
+                action_mask = self._build_action_mask()
+
+                # -- Agent Input (LSTM sequences or flat state) ----------------
+                if self.lstm_enabled:
+                    agent_state = self.state_builder.build_state_sequences(
+                        self.state_buffer, self.sequence_lengths
+                    )
+                else:
+                    agent_state = state
+
+                # -- Agent Decision --------------------------------------------
+                action = self.agent.select_action(
+                    agent_state, action_mask, deterministic=True
+                )
+                action_str = self._decode_action(action)
+
+                avg_q = float(getattr(self.agent, "last_avg_q", 0.0))
+
+                # -- Execute Trade ---------------------------------------------
+                old_count = self.executor.get_position_info()["count"]
+                try:
+                    trade_symbol, trade_side, trade_pnl = self._execute_action(
+                        action
+                    )
+                except Exception as e:
+                    # Order failed -- log it but don't crash the bot
+                    _log.error(f"Trade execution failed: {e}")
+                    trade_symbol, trade_side, trade_pnl = "", "", 0.0
+
+                new_count = self.executor.get_position_info()["count"]
+
+                if trade_symbol and new_count != old_count:
+                    self.daily_trades += 1
+                    if trade_pnl > 0:
+                        self.winning_trades += 1
+                    elif trade_pnl < 0:
+                        self.losing_trades += 1
+
+                    # -- DB logging ------------------------------------------
+                    if new_count > old_count:
+                        # Position opened: fetch fill details from executor
+                        try:
+                            pos = self.executor.get_position_info()[
+                                "positions"
+                            ].get(trade_symbol, {})
+                            all_symbols = (
+                                self.current_coins["gainers"]
+                                + self.current_coins["losers"]
+                            )
+                            coin_rank = (
+                                all_symbols.index(trade_symbol)
+                                if trade_symbol in all_symbols
+                                else 0
+                            )
+                            is_gainer = coin_rank < 10
+                            trade_key = self.logger.log_trade_open(
+                                session_key=self.current_session_key,
+                                symbol=trade_symbol,
+                                side=trade_side,
+                                action_id=action,
+                                entry_price=pos.get("entry_price", 0.0),
+                                quantity=pos.get("size", 0.0),
+                                portfolio_value=current_balance,
+                                open_positions=new_count,
+                                avg_q=avg_q,
+                                coin_rank=coin_rank,
+                                is_gainer=is_gainer,
+                            )
+                            self.open_trade_keys[trade_symbol] = trade_key
+                        except Exception as e:
+                            _log.error(f"DB log_trade_open failed: {e}")
+
+                    elif new_count < old_count:
+                        # Track realized PnL for portfolio feature rolling stats
+                        if trade_pnl != 0.0:
+                            self._step_pnls.append(trade_pnl)
+                            if len(self._step_pnls) > 100:
+                                self._step_pnls = self._step_pnls[-100:]
+
+                        # Position closed: update the open trade row
+                        try:
+                            trade_key = self.open_trade_keys.pop(trade_symbol, None)
+                            exit_price = self._last_close_exit_prices.pop(
+                                trade_symbol, 0.0
+                            )
+                            if trade_key:
+                                self.logger.log_trade_close(
+                                    trade_key=trade_key,
+                                    exit_price=exit_price,
+                                    pnl=trade_pnl,
+                                    pnl_percent=(
+                                        (trade_pnl / current_balance * 100)
+                                        if current_balance > 0
+                                        else 0.0
+                                    ),
+                                )
+                        except Exception as e:
+                            _log.error(f"DB log_trade_close failed: {e}")
+
+                # -- Write state for web dashboard --------------------------------
+                if trade_symbol:
+                    self._log_activity(
+                        f"Step {step}: {action_str}"
+                        + (f" → PnL {trade_pnl:+.2f}" if trade_pnl else " → opened")
+                    )
+                else:
+                    self._log_activity(f"Step {step}: {action_str}")
+                self._write_metrics(step, current_balance, action_str, avg_q, today_pnl)
+
+                # -- Countdown -------------------------------------------------
+                now = datetime.now()
+                seconds_into_interval = (now.minute % 5) * 60 + now.second
+                seconds_to_wait = 300 - seconds_into_interval
+                time.sleep(seconds_to_wait)
+
+            except KeyboardInterrupt:
+                raise  # Propagate so outer handler can clean up
+
+            except Exception as e:
+                # Unexpected error -- log it, wait out the interval, then continue
+                import traceback
+
+                _log.error(f"Unexpected loop error: {e}\n{traceback.format_exc()}")
+                self._wait_for_next_interval("Recovering from error")
+
+        # -- Cleanup ------------------------------------
         print("\n🛑 Bot stopped.")
         print(f"  Steps completed : {step}")
         print(f"  Trades executed : {self.daily_trades}")
@@ -809,8 +1220,8 @@ class TradingBot:
                 final_balance=final_bal,
                 total_pnl=final_bal - self.initial_balance,
                 total_trades=self.daily_trades,
-                winning_trades=self.dashboard.winning_trades,
-                losing_trades=self.dashboard.losing_trades,
+                winning_trades=self.winning_trades,
+                losing_trades=self.losing_trades,
             )
         self.logger.shutdown(timeout=5.0)
         print("Done.")
