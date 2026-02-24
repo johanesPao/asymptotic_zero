@@ -1,14 +1,16 @@
 services:
-  asymptotic_zero:
+  bot:
     image: ghcr.io/johanespao/asymptotic_zero:latest
     container_name: asymptotic_zero
+    command: ["python", "scripts/trading_bot.py"]
 
     # Restart automatically unless manually stopped (survives VPS reboots).
     # Orderly daily restarts at 07:00 WIB are handled by the at-job scheduler
     # written by GitHub Actions on every deploy.
     restart: unless-stopped
 
-    # All runtime secrets come from the .env file written by GitHub Actions
+    # All runtime secrets come from the .env file written by GitHub Actions.
+    # Contains Infisical credentials; actual trading secrets are fetched at runtime.
     env_file:
       - .env
 
@@ -21,12 +23,36 @@ services:
     # logs volume is always writable without manual chown on the host.
     user: "1001:1001"
 
-    # Persist log files on VPS between container restarts / image updates
+    # Persist log files and metrics JSON on VPS between container restarts.
+    # Shared with the dashboard service so the dashboard can read bot output.
     volumes:
       - ./logs:/app/logs
 
-    # TTY enabled so Rich dashboard renders correctly when attaching.
-    # Attach with: docker attach asymptotic_zero
-    # Detach without stopping: Ctrl+P then Ctrl+Q
-    stdin_open: true
-    tty: true
+  dashboard:
+    image: ghcr.io/johanespao/asymptotic_zero:latest
+    container_name: asymptotic_zero_dashboard
+    command: ["python", "scripts/trading_web_dashboard.py"]
+
+    # Restart automatically alongside the bot.
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TF_CPP_MIN_LOG_LEVEL=2
+      - TF_ENABLE_ONEDNN_OPTS=0
+
+    user: "1001:1001"
+
+    # Shared log volume: dashboard reads metrics JSON written by the bot.
+    volumes:
+      - ./logs:/app/logs
+
+    # Expose web dashboard on port 8585 (accessible via Tailscale or LAN).
+    ports:
+      - "8585:8585"
+
+    depends_on:
+      - bot
