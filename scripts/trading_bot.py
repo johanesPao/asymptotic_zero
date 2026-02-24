@@ -7,6 +7,8 @@ Main trading loop that connects all components:
 - Agent decision making
 - Trade execution
 - Web dashboard state updates
+
+v2: Added position reconciliation with Binance to prevent state divergence
 """
 
 import sys
@@ -175,7 +177,92 @@ class TradingBot:
         self.winning_trades = 0
         self.losing_trades = 0
 
+        # Sync positions with Binance on startup
+        print("🔄 Syncing positions with Binance...")
+        try:
+            actual_positions = self._sync_positions_with_binance()
+            print(f"✅ Position sync complete: {len(actual_positions)} open positions")
+            if actual_positions:
+                print("   Open positions found on Binance:")
+                for sym, pos in actual_positions.items():
+                    print(f"     - {sym}: {pos['side']} {pos['size']} @ ${pos['entry_price']:.2f}")
+        except Exception as e:
+            print(f"⚠️  Initial position sync failed: {e}")
+            print("   Continuing with empty position state...")
+
         print("\n🤖 Bot initialized successfully!\n")
+
+    def _sync_positions_with_binance(self) -> dict:
+        """
+        Query Binance for actual open positions and reconcile with internal state.
+        
+        This is the source of truth. Call this:
+        - On startup
+        - Before every trading decision
+        - After every order execution
+        
+        Returns:
+            Dict of actual positions from Binance
+        """
+        try:
+            # Query Binance futures positions
+            binance_positions = self.client.futures_position_information()
+            
+            # Filter to only positions with non-zero size
+            actual_positions = {}
+            for pos in binance_positions:
+                size = float(pos['positionAmt'])
+                if abs(size) > 0.0001:  # Ignore dust
+                    symbol = pos['symbol']
+                    actual_positions[symbol] = {
+                        'symbol': symbol,
+                        'side': 'LONG' if size > 0 else 'SHORT',
+                        'size': abs(size),
+                        'entry_price': float(pos['entryPrice']),
+                        'unrealized_pnl': float(pos['unRealizedProfit']),
+                        'leverage': int(pos['leverage']),
+                    }
+            
+            # Get bot's internal positions
+            internal_positions = self.executor.get_position_info()['positions']
+            internal_symbols = set(internal_positions.keys())
+            actual_symbols = set(actual_positions.keys())
+            
+            # Find discrepancies
+            ghost_positions = internal_symbols - actual_symbols
+            unknown_positions = actual_symbols - internal_symbols
+            
+            # Log and fix ghost positions (bot thinks it's open, but it's not)
+            if ghost_positions:
+                _log.warning(f"👻 Ghost positions detected (removing from internal state): {ghost_positions}")
+                for symbol in ghost_positions:
+                    # Remove from executor's internal tracking
+                    if hasattr(self.executor, 'positions'):
+                        self.executor.positions.pop(symbol, None)
+                    # Remove from guardrails
+                    self.guardrails.record_position_closed(symbol)
+            
+            # Log unknown positions (open on Binance but bot doesn't know)
+            if unknown_positions:
+                _log.warning(f"🔍 Unknown positions detected on Binance (adding to internal state): {unknown_positions}")
+                # Add them to internal state
+                for symbol in unknown_positions:
+                    pos = actual_positions[symbol]
+                    if hasattr(self.executor, 'positions'):
+                        self.executor.positions[symbol] = pos
+                    # Record in guardrails
+                    self.guardrails.record_position_opened(symbol)
+            
+            # Update executor's internal state with Binance truth
+            if hasattr(self.executor, 'positions'):
+                self.executor.positions = actual_positions.copy()
+            
+            return actual_positions
+            
+        except Exception as e:
+            _log.error(f"Position sync with Binance failed: {e}")
+            # Return empty dict on failure — better to be cautious
+            return {}
 
     def log_event(self, level: str, message: str, extra_data: dict = None):
         """Log event to file."""
@@ -904,6 +991,47 @@ class TradingBot:
 
         return mask
 
+    def _sync_positions_with_binance(self) -> dict:
+        """Query Binance for actual open positions and reconcile with internal state.
+
+        Detects and fixes two types of divergence:
+          - Ghost positions: bot thinks it's open, Binance says it's closed
+          - Unknown positions: open on Binance but bot has no record
+
+        Returns the live Binance positions dict (symbol → position info).
+        """
+        binance_positions = self.client.futures_position_information()
+        actual: dict = {}
+        for pos in binance_positions:
+            amt = float(pos["positionAmt"])
+            if abs(amt) > 0.0001:
+                sym = pos["symbol"]
+                actual[sym] = {
+                    "side": "LONG" if amt > 0 else "SHORT",
+                    "size": abs(amt),
+                    "entry_price": float(pos["entryPrice"]),
+                    "unrealized_pnl": float(pos["unRealizedProfit"]),
+                    "leverage": int(pos["leverage"]),
+                }
+
+        internal = set(self.executor.positions.keys())
+        actual_syms = set(actual.keys())
+
+        # Ghost positions — remove from executor and guardrails
+        for sym in internal - actual_syms:
+            _log.warning(f"👻 Ghost position removed: {sym}")
+            self.executor.positions.pop(sym, None)
+            self.guardrails.record_position_closed(sym)
+
+        # Unknown positions — add to executor and guardrails
+        for sym in actual_syms - internal:
+            _log.warning(f"🔍 Unknown position adopted: {sym}")
+            self.executor.positions[sym] = actual[sym]
+            if sym not in self.guardrails.position_history:
+                self.guardrails.record_position_opened(sym)
+
+        return actual
+
     def _wait_for_next_interval(self, reason: str = ""):
         """Sit out the rest of the current 5-minute interval."""
         if reason:
@@ -1079,6 +1207,13 @@ class TradingBot:
                 # -- Step ------------------------------------------------------
                 step += 1
                 self.guardrails.step()
+
+                # Sync positions with Binance BEFORE every decision to catch
+                # ghost / unknown positions from previous steps or manual trades.
+                try:
+                    self._sync_positions_with_binance()
+                except Exception as e:
+                    _log.warning(f"Pre-step position sync failed: {e}")
 
                 # Signal the dashboard that we are working on this step.
                 # record_history=False: balance is stale here (equity not fetched yet),
@@ -1302,6 +1437,13 @@ class TradingBot:
                     _log.error(f"Trade execution failed: {e}")
                     trade_symbol, trade_side, trade_pnl = "", "", 0.0
 
+                # Sync with Binance after execution to verify the order filled
+                # and reconcile any state divergence before counting positions.
+                try:
+                    time.sleep(0.5)  # give exchange 500 ms to settle
+                    self._sync_positions_with_binance()
+                except Exception as e:
+                    _log.warning(f"Post-trade position sync failed: {e}")
                 new_count = self.executor.get_position_info()["count"]
 
                 # Accumulate realized PnL (closes only — trade_pnl is 0 on opens)
