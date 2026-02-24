@@ -1,84 +1,314 @@
 # ═══════════════════════════════════════════════════════════════════════════════
-# TRADING ENVIRONMENT CONFIGURATION
+# TRADING ENVIRONMENT CONFIGURATION — v2 (IQN + Action Masking + Curriculum)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # ───────────────────────────────────────────────────────────────────────────────
 # PORTFOLIO SETTINGS
 # ───────────────────────────────────────────────────────────────────────────────
 portfolio:
-  initial_balance: 10000.0 # Starting balance in USDT
-  max_positions: 3 # Maximum concurrent position
-  position_size_pct: 0.20 # Each position = 20% of portfolio
-  leverage: 10 # Leverage multiplier (1 = no leverage)
+  initial_balance: 10000.0        # Starting balance in USDT
+  max_positions: 3                # Maximum concurrent positions
+  leverage: 10                    # Leverage multiplier
+
+  # Position sizing — three sizes map to small/medium/large action variants
+  position_sizes:
+    small:  0.10                  # 10% of portfolio per position
+    medium: 0.20                  # 20% of portfolio per position
+    large:  0.30                  # 30% of portfolio per position
 
 # ───────────────────────────────────────────────────────────────────────────────
 # TRADING COSTS
+# All costs are deducted from reward during training so the agent learns
+# that every trade has friction — discouraging overtrading.
 # ───────────────────────────────────────────────────────────────────────────────
 costs:
-  maker_fee_pct: 0.02 # 0.02% maker fee (limit orders)
-  taker_fee_pct: 0.04 # 0.04% taker fee (market orders)
-  slippage_pct: 0.01 # 0.01% estimated slippage
-  use_taker_fees: true # Assume market orders (taker fees)
+  maker_fee_pct: 0.02             # 0.02% maker fee (limit orders)
+  taker_fee_pct: 0.04             # 0.04% taker fee (market orders)
+  slippage_pct:  0.01             # 0.01% estimated slippage
+  use_taker_fees: true            # Assume market orders (taker fees)
+  funding_rate_pct: 0.01          # 0.01% per 8h (approx perpetual funding)
+  funding_interval_steps: 96     # 96 × 5min = 8 hours between funding payments
 
 # ───────────────────────────────────────────────────────────────────────────────
 # ACTION SPACE
+# Total: 143 discrete actions
+#   0       : HOLD
+#   1–30    : OPEN LONG  gainer[0-9] × 3 sizes (small/medium/large)
+#   31–60   : OPEN SHORT gainer[0-9] × 3 sizes
+#   61–70   : CLOSE gainer[0-9]               (no size variant)
+#   71–100  : OPEN LONG  loser[0-9]  × 3 sizes
+#   101–130 : OPEN SHORT loser[0-9]  × 3 sizes
+#   131–140 : CLOSE loser[0-9]               (no size variant)
+#   141     : CLOSE_ALL
+#   142     : CLOSE_WORST
 # ───────────────────────────────────────────────────────────────────────────────
 actions:
-  num_coins_per_side: 10 # 10 gainers + 10 losers
-  enable_reverse: false # Disable reverse actions (simplify)
-  enable_close_all: true # Enable close all positions
-  enable_close_worst: true # Enable close worst position
+  num_coins_per_side: 10          # 10 gainers + 10 losers
+  num_sizes: 1                    # 1 = medium size only (reduces action space to 63)
+  enable_close_all:   true
+  enable_close_worst: true
 
-  # Action mapping:
-  # 0: HOLD
-  # 1-10: LONG gainer[0-9]
-  # 11-20: SHORT gainer[0-9]
-  # 21-30: CLOSE gainer[0-9]
-  # 31-40: LONG loser[0-9]
-  # 41-50: SHORT loser[0-9]
-  # 51-60: CLOSE loser[0-9]
-  # 61: CLOSE_ALL
-  # 62: CLOSE_WORST
+# ───────────────────────────────────────────────────────────────────────────────
+# GUARDRAILS — enforced inside the environment (baked into training)
+# ───────────────────────────────────────────────────────────────────────────────
+guardrails:
+  cooldown_steps: 5               # Steps before opening a new position after close
+  min_hold_steps: 3               # Minimum steps before a position can be closed
+  max_daily_loss_pct: 0.15        # Stop trading if daily loss exceeds 15%
+  max_daily_trades: 50            # Circuit breaker on overtrading
 
 # ───────────────────────────────────────────────────────────────────────────────
 # EPISODE SETTINGS
 # ───────────────────────────────────────────────────────────────────────────────
 episode:
-  candles_per_day: 288 # 5-minute candles per day
-  warmup_candles: 200 # Skip first N candles (indicator warmup)
-  force_close_at_end: true # Close all positions at end of day
+  candles_per_day:  288           # 5-minute candles per 24h
+  warmup_candles:   0             # No warmup — historical candles handle TA convergence
+  historical_candles: 135         # Prepend this many candles from prior dates for TA convergence
+  force_close_at_end: true        # Close all positions at end of day
 
 # ───────────────────────────────────────────────────────────────────────────────
-# REWARD SETTINGS
+# REWARD SETTINGS — SIMPLIFIED v3
+# Focus on core metrics: realized PnL, risk-adjusted returns, position sizing
 # ───────────────────────────────────────────────────────────────────────────────
 reward:
-  type: "pnl_aligned" # Options: "pnl", "sharpe", "sortino", "calmar"
-  pnl_scale: 100.0
+  # PRIMARY: Realized PnL (main signal)
+  realized_pnl_weight: 1.5           # Increased from 1.0 - stronger signal for closed trades
 
-  # PnL-based reward
-  pnl:
-    scale: 100.0 # Multiply PnL by this factor
-    clip_min: -10.0 # Clip minimum reward
-    clip_max: 10.0 # Clip maximum reward
+  # SECONDARY: Unrealized PnL shaping (teaches during holding)
+  unrealized_shaping:
+    scale: 0.02                     # Increased from 0.01 - stronger signal
+    enabled: true
 
-  # Penalties
-  penalties:
-    invalid_action: -0.01 # Penalty for invalid actions
-    excessive_trading: -0.01 # Penalty per trade (discourage overtrading)
-    holding_losing: -0.001 # Small penalty per step holding losing position
+  # RISK-ADJUSTED: Sharpe-like reward
+  sharpe:
+    window_steps: 20
+    scale: 1.5                     # Increased from 1.0 - reward good risk-adjusted returns
+    min_trades_for_sharpe: 5
 
-  # Bonuses
-  bonuses:
-    profitable_close: 0.5 # Bonus for closing profitable position
-    winning_streak: 0.1 # Bonus per consecutive win
+  # POSITION SIZING: Penalty for large positions
+  position_size_penalty: 0.3        # New - discourage oversized positions
+
+  # TRADING FREQUENCY: Penalty for overtrading
+  trading_frequency_penalty: 0.15   # New - discourage excessive trading
+
+  # DISABLED COMPONENTS (removed for simplification):
+  # - holding_loss_penalty_per_step: was causing premature closes
+  # - patience_bonus_per_step: was encouraging holding losing positions
+  # - drawdown_penalty_scale: conflicting with PnL signals
+  # - episode_end bonuses: creating horizon issues
+
+  # Transaction cost awareness (still needed)
+  cost_penalty:
+    enabled: false                 # PnL already includes fees
+    scale: 1.0
+
+  # Funding rate penalty
+  funding_penalty:
+    enabled: true
+    scale: 1.0
+
+  # Invalid action penalty
+  invalid_action_penalty: -0.1
+
+  # Inactivity penalty (reduced)
+  inactivity_penalty:
+    enabled: true
+    per_step: -0.0005              # Reduced from -0.001
+
+  # PnL scaling
+  pnl_scale: 0.15                  # Increased from 0.1
+
+  # Normalization
+  normalization:
+    enabled: true
+    ema_alpha: 0.001
+    warmup_steps: 500
+    clip_range: 10.0
+
+# ───────────────────────────────────────────────────────────────────────────────
+# MARKET REGIME FEATURES
+# Added to state so agent knows what kind of market it's operating in.
+# ───────────────────────────────────────────────────────────────────────────────
+regime:
+  adx_period: 14                  # ADX period for trend strength
+  volatility_lookback: 24         # Steps for rolling realized volatility (2h)
+  breadth_threshold: 0.6          # Fraction of coins considered "consensus"
+  momentum_persistence_window: 6  # Steps for momentum consistency check
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CURRICULUM LEARNING
+# Training progresses through market difficulty stages.
+# ───────────────────────────────────────────────────────────────────────────────
+curriculum:
+  enabled: false                  # Disabled — train on all days uniformly
+  stages:
+    - name: "trending"
+      description: "Strong trending days — clearest signal"
+      adx_percentile_min: 67         # Top third by ADX
+      episodes: 4000
+      epsilon_start: 1.0             # Full exploration per stage
+      guardrails:
+        cooldown_steps: 5
+        min_hold_steps: 3
+        max_daily_trades: 30
+        max_daily_loss_pct: 0.10
+
+    - name: "ranging"
+      description: "Sideways/ranging days — teaches patience"
+      adx_percentile_max: 33         # Bottom third by ADX
+      episodes: 4000
+      epsilon_start: 1.0
+      guardrails:
+        cooldown_steps: 3
+        min_hold_steps: 2
+        max_daily_trades: 40
+        max_daily_loss_pct: 0.12
+
+    - name: "volatile"
+      description: "High volatility days — teaches risk management"
+      vol_percentile_min: 67         # Top third by volatility
+      episodes: 4000
+      epsilon_start: 1.0
+      guardrails:
+        cooldown_steps: 2
+        min_hold_steps: 1
+        max_daily_trades: 50
+        max_daily_loss_pct: 0.15
+
+    - name: "full"
+      description: "All days — final generalization stage"
+      episodes: 20000
+      epsilon_start: 1.0
+      guardrails:
+        cooldown_steps: 0
+        min_hold_steps: 0
+        max_daily_trades: 100
+        max_daily_loss_pct: 0.15
+
+  # Progression: advance stage when rolling win_rate > threshold for N episodes
+  stage_advance_win_rate: 0.52
+  stage_advance_window: 200
+
+# Top-level flag to skip curriculum from CLI
+no_curriculum: true
+
+# ───────────────────────────────────────────────────────────────────────────────
+# TRAINING MONITORING
+# TensorBoard logging, periodic evaluation, and action distribution alerts.
+# ───────────────────────────────────────────────────────────────────────────────
+monitoring:
+  eval_freq_episodes: 500          # Run deterministic eval every N episodes
+  eval_episodes: 30                # Number of eval episodes per evaluation
+  hold_warning_pct: 0.80           # Warn if HOLD exceeds this fraction of actions
+
+# ───────────────────────────────────────────────────────────────────────────────
+# LSTM MULTI-SCALE ARCHITECTURE — v3 (Larger capacity)
+# Three timescales for temporal awareness: short/medium/long term context
+# ───────────────────────────────────────────────────────────────────────────────
+lstm:
+  enabled: true
+  sequence_lengths: [10, 20, 30]  # Short (50min), Medium (100min), Long (150min)
+  hidden_sizes: [128, 128, 128]  # Increased from [64,64,64] - more capacity
+  dropout_rate: 0.15             # Reduced from 0.2 - less aggressive dropout
+  use_bidirectional: false
+
+# ───────────────────────────────────────────────────────────────────────────────
+# IQN NETWORK ARCHITECTURE
+# Implicit Quantile Network — learns full return distribution, not just mean.
+# Combined with LSTM for temporal awareness.
+# ───────────────────────────────────────────────────────────────────────────────
+network:
+  # Feature extraction (shared trunk — processes combined LSTM outputs)
+  hidden_layers: [512, 256, 128]
+  dropout_rate: 0.1
+  use_layer_norm: true
+
+  # IQN-specific — increased for better distributional learning
+  embedding_dim: 128              # Increased from 64 - richer quantile embeddings
+  num_quantiles_train: 16         # Increased from 8 - better distribution learning
+  num_quantiles_inference: 64    # Increased from 32 - more stable greedy actions
+  q_clip: 10.0
+  risk_distortion: "neutral"
+
+  # Risk level for CVaR (only used if risk_distortion = cvar)
+  cvar_alpha: 0.25                # Focus on worst 25% of outcomes
+
+# ───────────────────────────────────────────────────────────────────────────────
+# AGENT HYPERPARAMETERS — v3 (Optimized for faster learning)
+# ───────────────────────────────────────────────────────────────────────────────
+agent:
+  learning_rate: 0.00005           # Increased from 0.00003 - faster learning
+  gamma: 0.95                     # Discount factor (bounded horizon ~20 steps)
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay_percentage: 0.70  # Reduced from 0.85 - faster decay to exploitation
+  epsilon_decay_type: "cosine"    # "cosine" or "linear" — cosine explores more broadly early
+  batch_size: 64                  # Increased from 32 - more stable gradients
+  replay_capacity: 100000
+  min_replay_size: 2000
+  target_update_freq: 100
+
+  # Target network update
+  use_soft_update: false
+  target_update_tau: 0.005
+
+  # Learning rate schedule - LESS aggressive decay
+  use_lr_schedule: true
+  gradient_clip: 1.0
+  train_freq: 4
+
+# ───────────────────────────────────────────────────────────────────────────────
+# PRIORITIZED EXPERIENCE REPLAY (PER)
+# Samples more from transitions with higher TD error → faster learning.
+# ───────────────────────────────────────────────────────────────────────────────
+replay:
+  per_enabled: true
+  per_alpha: 0.6                  # Prioritization exponent (0 = uniform, 1 = full priority)
+  per_beta_start: 0.4             # Importance-sampling correction start
+  per_beta_end: 1.0               # Anneal IS correction to 1.0 over training
+  per_epsilon: 0.000001           # Small constant to avoid zero priority
+
+# ───────────────────────────────────────────────────────────────────────────────
+# WALK-FORWARD VALIDATION
+# ───────────────────────────────────────────────────────────────────────────────
+evaluation:
+  walk_forward:
+    enabled: true
+    train_window_months: 12       # Train on 12 months
+    test_window_months: 1         # Test on next 1 month
+    step_months: 1                # Slide forward by 1 month per fold
+    min_folds: 6                  # Minimum folds for reliable evaluation
+
+  # Metrics to track per fold
+  metrics:
+    - sharpe_ratio
+    - profit_factor
+    - win_rate
+    - max_drawdown
+    - avg_daily_pnl
+    - invalid_action_rate          # New — track if action masking is working
 
 # ───────────────────────────────────────────────────────────────────────────────
 # STATE NORMALIZATION
 # ───────────────────────────────────────────────────────────────────────────────
 normalization:
-  method: "zscore" # Options: "zscore", "minmax", "robust"
-  clip_outliers: true # Clip extreme values
-  clip_std: 3.0 # Clip at +- 3 standard deviations
+  method: "zscore"                # Options: zscore / minmax / robust
+  clip_outliers: true
+  clip_std: 3.0
+
+# ───────────────────────────────────────────────────────────────────────────────
+# ADVERSARIAL TRAINING — Reduced for faster learning
+# Random perturbations to make the agent robust to real-world messiness.
+# Temporarily reduced to speed up learning
+# ───────────────────────────────────────────────────────────────────────────────
+adversarial:
+  enabled: true
+  price_noise_std: 0.0001         # Reduced from 0.0002
+  slippage_spike_prob: 0.01       # Reduced from 0.02
+  slippage_spike_mult: 3.0        # Reduced from 5.0
+  data_gap_prob: 0.005            # Reduced from 0.01
+  flash_crash_prob: 0.0005       # Reduced from 0.001
+  flash_crash_magnitude: 0.03    # Reduced from 0.05
 
 # ───────────────────────────────────────────────────────────────────────────────
 # DATA PATHS
@@ -86,4 +316,5 @@ normalization:
 data:
   five_minute_dir: "data/volatility/5m"
   top_movers_file: "data/volatility/top_movers.parquet"
-  features_config: "config/features.yaml"
+  features_config:  "config/features.yaml"
+  regime_cache:     "data/regime_labels.parquet"  # Pre-computed regime labels

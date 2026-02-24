@@ -14,6 +14,7 @@ charset-normalizer==3.4.4
 cloudpickle==3.1.2
 dateparser==1.2.2
 flatbuffers==25.12.19
+fastapi==0.115.5
 frozenlist==1.8.0
 gast==0.7.0
 google-pasta==0.2.0
@@ -92,6 +93,7 @@ typing_extensions==4.15.0
 tzdata==2025.3
 tzlocal==5.3.1
 urllib3==2.6.2
+uvicorn==0.32.1
 websockets==16.0
 Werkzeug==3.1.4
 wheel==0.45.1

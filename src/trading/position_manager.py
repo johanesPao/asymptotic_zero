@@ -137,7 +137,6 @@ class PositionManager:
         max_positions: int = 3,
         position_size_pct: float = 0.20,
         taker_fee_pct: float = 0.04,
-        slippage_pct: float = 0.01,
     ):
         """
         Initialize the position manager.
@@ -147,13 +146,11 @@ class PositionManager:
             max_positions: Maximum concurrent positions
             position_size_pct: Each position as fraction of portfolio
             taker_fee_pct: Trading fee percentage
-            slippage_pct: Estimated slippage percentage
         """
         self.initial_balance = initial_balance
         self.max_positions = max_positions
         self.position_size_pct = position_size_pct
         self.taker_fee_pct = taker_fee_pct
-        self.slippage_pct = slippage_pct
 
         # State
         self.cash: float = initial_balance
@@ -161,6 +158,8 @@ class PositionManager:
         self.trade_history: List[TradeRecord] = []
         self.total_fees_paid: float = 0.0
         self.current_step: int = 0
+        self._peak_portfolio: float = initial_balance
+        self._step_pnls: List[float] = []  # for rolling Sharpe / volatility
 
     def reset(self):
         """Reset to initial state for new episode."""
@@ -169,6 +168,8 @@ class PositionManager:
         self.trade_history = []
         self.total_fees_paid = 0.0
         self.current_step: int = 0
+        self._peak_portfolio = self.initial_balance
+        self._step_pnls = []
 
     def set_step(self, step: int):
         """Set current timestep."""
@@ -236,42 +237,35 @@ class PositionManager:
             return False, f"Already have position on coin {coin_index}"
 
         # Calculate position size and fees
+        # NOTE: price already has slippage applied by TradingEnvironment
         position_size = self.get_position_size()
         entry_fee = position_size * (self.taker_fee_pct / 100)
-        slippage_cost = position_size * (self.slippage_pct / 100)
-        total_cost = entry_fee + slippage_cost
-
-        # Adjust entry price for slippage
-        if side == PositionSide.LONG:
-            adjusted_price = price * (1 + self.slippage_pct / 100)
-        else:
-            adjusted_price = price * (1 - self.slippage_pct / 100)
 
         # Check if we have enough cash
-        if self.cash < position_size + total_cost:
+        if self.cash < position_size + entry_fee:
             return False, "Insufficient cash"
 
         # Deduct cash (position size is locked, fee is paid)
-        self.cash -= position_size + total_cost
+        self.cash -= position_size + entry_fee
         self.total_fees_paid += entry_fee
 
-        # Create position
+        # Create position (price is already slippage-adjusted by environment)
         position = Position(
             symbol=symbol,
             side=side,
-            entry_price=adjusted_price,
+            entry_price=price,
             size=position_size,
             entry_time=self.current_step,
             coin_index=coin_index,
             is_gainer=is_gainer,
-            current_price=adjusted_price,
+            current_price=price,
         )
 
         self.positions[coin_index] = position
 
         side_str = "LONG" if side == PositionSide.LONG else "SHORT"
         logger.debug(
-            f"Opened {side_str} {symbol} @ {adjusted_price:.6f}, size={position_size:.2f}"
+            f"Opened {side_str} {symbol} @ {price:.6f}, size={position_size:.2f}"
         )
 
         return True, f"Opened {side_str} position"
@@ -292,38 +286,39 @@ class PositionManager:
 
         position = self.positions[coin_index]
 
-        # Adjust exit price for slippage
-        if position.side == PositionSide.LONG:
-            # Selling: slippage works against us
-            adjusted_price = price * (1 - self.slippage_pct / 100)
-        else:
-            # Buying back: slippage works against us
-            adjusted_price = price * (1 + self.slippage_pct / 100)
-
-        # Calculated PnL
+        # NOTE: price already has slippage applied by TradingEnvironment
+        # Calculate PnL
         exit_fee = position.size * (self.taker_fee_pct / 100)
-        realized_pnl = position.get_exit_pnl(adjusted_price, self.taker_fee_pct)
+        realized_pnl = position.get_exit_pnl(price, self.taker_fee_pct)
 
         # Calculate PnL percentage
         if position.side == PositionSide.LONG:
             pnl_pct = (
-                (adjusted_price - position.entry_price) / position.entry_price * 100
+                (price - position.entry_price) / position.entry_price * 100
             )
         else:
             pnl_pct = (
-                (position.entry_price - adjusted_price) / position.entry_price * 100
+                (position.entry_price - price) / position.entry_price * 100
             )
 
         # Return cash + PnL
         self.cash += position.size + realized_pnl
         self.total_fees_paid += exit_fee
 
-        # Return trade
+        # Track PnL for rolling stats
+        self._step_pnls.append(realized_pnl)
+
+        # Update peak portfolio
+        pv = self.get_portfolio_value()
+        if pv > self._peak_portfolio:
+            self._peak_portfolio = pv
+
+        # Record trade
         trade = TradeRecord(
             symbol=position.symbol,
             side=position.side,
             entry_price=position.entry_price,
-            exit_price=adjusted_price,
+            exit_price=price,
             size=position.size,
             entry_time=position.entry_time,
             exit_time=self.current_step,
@@ -340,7 +335,7 @@ class PositionManager:
 
         side_str = "LONG" if position.side == PositionSide.LONG else "SHORT"
         logger.debug(
-            f"Closed {side_str} {position.symbol} @ {adjusted_price:.6f}, PnL={realized_pnl:.2f}"
+            f"Closed {side_str} {position.symbol} @ {price:.6f}, PnL={realized_pnl:.2f}"
         )
 
         return True, f"Closed position, PnL: {realized_pnl:.2f}", realized_pnl
@@ -370,7 +365,7 @@ class PositionManager:
 
         return closed, total_pnl
 
-    def close_worst_position(self, prices: Dict[int, float]) -> Tuple[bool, float]:
+    def close_worst_position(self, prices: Dict[int, float]) -> Tuple[bool, float, int]:
         """
         Close the worst performing position.
 
@@ -378,10 +373,10 @@ class PositionManager:
             prices: Dictionary of coin_index -> current_price
 
         Returns:
-            (success, pnl) tuple
+            (success, pnl, coin_index) tuple — coin_index is -1 if no positions
         """
         if not self.positions:
-            return False, 0.0
+            return False, 0.0, -1
 
         # Update positions first
         self.update_positions(prices)
@@ -392,7 +387,7 @@ class PositionManager:
         )
 
         success, _, pnl = self.close_position(worst_coin, prices[worst_coin])
-        return success, pnl
+        return success, pnl, worst_coin
 
     def get_position_features(self, num_coins: int = 20) -> np.ndarray:
         """
@@ -402,34 +397,35 @@ class PositionManager:
             num_coins: Total number of coins (gainers + losers)
 
         Returns:
-            Array of shape (num_coins, 6) with position features
+            Array of shape (num_coins, 8) with position features
         """
-        features = np.zeros((num_coins, 6))
+        features = np.zeros((num_coins, 8), dtype=np.float32)
+        total_portfolio = self.get_portfolio_value()
 
         for coin_index, position in self.positions.items():
             if coin_index < num_coins:
-                # has_position
+                # [0] has_position
                 features[coin_index, 0] = 1.0
-
-                # position_side: -1 (short), 0 (none), 1 (long)
+                # [1] position_side: -1 (short), 0 (none), 1 (long)
                 features[coin_index, 1] = position.side.value
-
-                # position_size (normalized by initial balance)
+                # [2] position_size (normalized by initial balance)
                 features[coin_index, 2] = position.size / self.initial_balance
-
-                # unrealized_pnl (normalized by position size)
+                # [3] unrealized_pnl (normalized by position size)
                 if position.size > 0:
                     features[coin_index, 3] = position.unrealized_pnl / position.size
-
-                # entry_price_distance
+                # [4] entry_price_distance
                 if position.entry_price > 0:
                     features[coin_index, 4] = (
                         position.current_price - position.entry_price
                     ) / position.entry_price
-
-                # holding_time (normalized by episode length, ~88 tradeable candles)
+                # [5] holding_time (normalized by episode length, ~88 tradeable candles)
                 holding_time = self.current_step - position.entry_time
                 features[coin_index, 5] = min(holding_time / 88.0, 1.0)
+                # [6] hold_duration in raw steps (normalized to 0-1 by 288 max candles)
+                features[coin_index, 6] = min(holding_time / 288.0, 1.0)
+                # [7] position size as fraction of total portfolio
+                if total_portfolio > 0:
+                    features[coin_index, 7] = position.size / total_portfolio
 
         return features
 
@@ -438,24 +434,47 @@ class PositionManager:
         Get portfolio-level features for state representation.
 
         Returns:
-            Array of shape (5,) with portfolio features
+            Array of shape (8,) with portfolio features
         """
         portfolio_value = self.get_portfolio_value()
         total_unrealized = sum(p.unrealized_pnl for p in self.positions.values())
 
+        # Rolling Sharpe from trade PnLs
+        if len(self._step_pnls) >= 3:
+            pnls = np.array(self._step_pnls[-20:])  # last 20 trades
+            rolling_sharpe = float(np.mean(pnls) / (np.std(pnls) + 1e-8))
+        else:
+            rolling_sharpe = 0.0
+
+        # Max drawdown pct
+        drawdown = (self._peak_portfolio - portfolio_value) / self._peak_portfolio
+
+        # Portfolio volatility (std of trade returns)
+        if len(self._step_pnls) >= 3:
+            vol = float(np.std(self._step_pnls[-20:]) / self.initial_balance)
+        else:
+            vol = 0.0
+
         features = np.array(
             [
-                # portfolio_value (normalized by initial balance)
+                # [0] portfolio_value (normalized by initial balance)
                 portfolio_value / self.initial_balance,
-                # cash_available (normalized by initial balance)
+                # [1] cash_available (normalized by initial balance)
                 self.cash / self.initial_balance,
-                # num_positions (normalized by max positions)
+                # [2] num_positions (normalized by max positions)
                 len(self.positions) / self.max_positions,
-                # total_unrealized_pnl (normalized by initial balance)
+                # [3] total_unrealized_pnl (normalized by initial balance)
                 total_unrealized / self.initial_balance,
-                # capacity_used (how much of max positions is used)
-                len(self.positions) / self.max_positions,
-            ]
+                # [4] total_fees_paid (normalized by initial balance)
+                self.total_fees_paid / self.initial_balance,
+                # [5] rolling Sharpe ratio (clipped)
+                np.clip(rolling_sharpe, -3.0, 3.0),
+                # [6] max drawdown percentage
+                np.clip(drawdown, 0.0, 1.0),
+                # [7] portfolio volatility
+                np.clip(vol, 0.0, 1.0),
+            ],
+            dtype=np.float32,
         )
 
         return features
@@ -488,7 +507,7 @@ class PositionManager:
             "winning_trades": len(winning),
             "losing_trades": len(losing),
             "win_rate": (
-                len(winning) / len(self.trade_history) * 100
+                len(winning) / len(self.trade_history)
                 if self.trade_history
                 else 0.0
             ),

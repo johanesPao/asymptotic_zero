@@ -1,14 +1,14 @@
 """
 Technical Indicators Calculator
 
-Calculates 200+ technical analysis features from OHLCV data using TA-Lib.
+Calculates technical analysis features from OHLCV data using TA-Lib.
 Features are organized into categories:
-- Trend (SMA, EMA, MACD, ADX, etc.)
-- Momentum (RSI, Stochastic, CCI, etc.)
-- Volatility (Bollinger Bands, ATR, etc.)
-- Volume (OBV, AD, CMF, etc.)
-- Price (Returns, Candle patterns, etc.)
-- Pattern (Trend direction, consecutive candles, etc.)
+- Trend (EMA, MACD, ADX)
+- Momentum (RSI, Stochastic, MFI)
+- Volatility (Bollinger Bands, ATR, NATR)
+- Volume (OBV, VWAP, Volume Ratio)
+- Price (Returns, Log Returns, Close Position)
+- Custom (HAZEMA — Heikin Ashi Zero Lag EMA)
 
 Usage:
     from src.data_pipeline.features import TechnicalIndicators
@@ -728,6 +728,51 @@ class TechnicalIndicators:
         return results
 
     # ═══════════════════════════════════════════════════════════════════════════
+    # CUSTOM INDICATORS
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    def _calculate_hazema(
+        self,
+        open_: np.ndarray,
+        high: np.ndarray,
+        low: np.ndarray,
+        close: np.ndarray,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Calculate HAZEMA (Heikin Ashi Zero Lag EMA).
+
+        1. Compute Heikin Ashi close: ha_close = (open + high + low + close) / 4
+        2. Compute Heikin Ashi open iteratively: ha_open[i] = (ha_open[i-1] + ha_close[i-1]) / 2
+        3. Compute Zero Lag EMA on ha_close:
+           - lag = floor((period - 1) / 2)
+           - delagged = 2 * ha_close - ha_close.shift(lag)
+           - hazema = EMA(delagged, period)
+        """
+        results = {}
+        custom_cfg = self.config.get("custom", {})
+        if "hazema" not in custom_cfg:
+            return results
+
+        period = custom_cfg["hazema"].get("period", 14)
+
+        # 1. Heikin Ashi close
+        ha_close = (open_ + high + low + close) / 4.0
+
+        # 2. Heikin Ashi open (iterative)
+        ha_open = np.empty_like(open_)
+        ha_open[0] = open_[0]
+        for i in range(1, len(open_)):
+            ha_open[i] = (ha_open[i - 1] + ha_close[i - 1]) / 2.0
+
+        # 3. Zero Lag EMA on ha_close
+        lag = (period - 1) // 2
+        delagged = 2.0 * ha_close - np.roll(ha_close, lag)
+        delagged[:lag] = ha_close[:lag]  # fill edge
+        results["hazema"] = talib.EMA(delagged, timeperiod=period)
+
+        return results
+
+    # ═══════════════════════════════════════════════════════════════════════════
     # MAIN CALCULATE METHOD
     # ═══════════════════════════════════════════════════════════════════════════
 
@@ -779,6 +824,9 @@ class TechnicalIndicators:
 
         logger.debug("Calculating pattern indicators...")
         all_features.update(self._calculate_pattern_features(open_, high, low, close))
+
+        logger.debug("Calculating custom indicators...")
+        all_features.update(self._calculate_hazema(open_, high, low, close))
 
         # Add features to DataFrame
         for name, values in all_features.items():
