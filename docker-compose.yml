@@ -18,6 +18,7 @@ services:
       - PYTHONUNBUFFERED=1
       - TF_CPP_MIN_LOG_LEVEL=2
       - TF_ENABLE_ONEDNN_OPTS=0
+      - TZ=Asia/Jakarta
 
     # Run as the same uid/gid as the VPS user (jpao = 1001) so the mounted
     # logs volume is always writable without manual chown on the host.
@@ -43,6 +44,7 @@ services:
       - PYTHONUNBUFFERED=1
       - TF_CPP_MIN_LOG_LEVEL=2
       - TF_ENABLE_ONEDNN_OPTS=0
+      - TZ=Asia/Jakarta
 
     user: "1001:1001"
 

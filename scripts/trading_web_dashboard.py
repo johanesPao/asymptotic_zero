@@ -942,12 +942,17 @@ async def dashboard():
         }
         
         function updateDashboard(data) {
+            // Update timestamp FIRST so it always shows even if later code errors
+            const luEl = document.getElementById('last-updated');
+            if (luEl) luEl.textContent = 'Updated: ' + new Date().toLocaleTimeString();
+
+            try {
             // Update portfolio metrics
             document.getElementById('balance').textContent = data.current_balance ? `$${data.current_balance.toFixed(2)}` : '-';
             document.getElementById('initial-balance').textContent = data.initial_balance ? `$${data.initial_balance.toFixed(2)}` : '-';
-            
-            const pnl = data.total_pnl || 0;
+
             const initBal = data.initial_balance || 0;
+            const pnl = initBal > 0 ? (data.current_balance || 0) - initBal : (data.total_pnl || 0);
             const pnlPct = initBal > 0 ? (pnl / initBal * 100) : 0;
             const pnlElement = document.getElementById('pnl');
             const pnlSign = pnlPct >= 0 ? '+' : '';
@@ -968,10 +973,10 @@ async def dashboard():
                 modeEl.textContent = isTestnet ? 'Testnet Trading' : 'Live Trading';
                 modeEl.className = isTestnet ? 'title-mode-testnet' : 'title-mode-live';
             }
-            
+
             document.getElementById('win-rate').textContent = data.win_rate ? `${(data.win_rate * 100).toFixed(1)}%` : '-';
             document.getElementById('trade-count').textContent = data.trade_count || '0';
-            
+
             // Update agent status
             document.getElementById('agent-status').textContent = data.agent_status || '-';
             document.getElementById('epsilon').textContent = data.epsilon ? data.epsilon.toFixed(3) : '-';
@@ -988,18 +993,18 @@ async def dashboard():
             }
 
             updateActivityLog(data.activity_log || []);
-            
+
             // Update guardrails
             const guardrails = data.guardrail_status || {};
             document.getElementById('cooldown').textContent = guardrails.cooldown_remaining || '0';
             document.getElementById('daily-trades').textContent = guardrails.daily_trades || '0';
-            
+
             // Update positions
             updatePositions(data.current_positions || []);
-            
+
             // Update trades
             updateTrades(data.recent_trades || []);
-            
+
             // Update PnL chart
             updatePnLChart(data);
 
@@ -1019,9 +1024,7 @@ async def dashboard():
                 }
             }
 
-            // Update timestamp in header
-            const luEl = document.getElementById('last-updated');
-            if (luEl) luEl.textContent = 'Updated: ' + new Date().toLocaleTimeString();
+            } catch (e) { console.error('updateDashboard error:', e); }
         }
         
         function updatePositions(positions) {
@@ -1033,6 +1036,7 @@ async def dashboard():
             }
             
             container.innerHTML = positions.map(pos => {
+                const side      = pos.side || 'UNKNOWN';
                 const size      = pos.size || 0;
                 const entry     = pos.entry_price || 0;
                 const mark      = pos.mark_price  || entry;
@@ -1040,15 +1044,16 @@ async def dashboard():
                 const entryAmt  = size * entry;
                 const markAmt   = size * mark;
                 const margin    = entryAmt / leverage;          // initial margin used
-                const roe       = margin > 0 ? (pos.unrealized_pnl / margin * 100) : 0;
-                const pnlSign   = pos.unrealized_pnl >= 0 ? '+' : '';
-                const pnlClass  = pos.unrealized_pnl >= 0 ? 'positive' : 'negative';
+                const upnl      = pos.unrealized_pnl || 0;
+                const roe       = margin > 0 ? (upnl / margin * 100) : 0;
+                const pnlSign   = upnl >= 0 ? '+' : '';
+                const pnlClass  = upnl >= 0 ? 'positive' : 'negative';
                 const fmt = (v, d=4) => v != null ? v.toFixed(d) : '—';
                 return `
                 <div class="position-item">
                     <div>
                         <div class="position-symbol">${pos.symbol}</div>
-                        <div class="position-side ${pos.side.toLowerCase()}">${pos.side} ${leverage}x</div>
+                        <div class="position-side ${side.toLowerCase()}">${side} ${leverage}x</div>
                     </div>
                     <div class="position-prices">
                         Entry&nbsp;<span>${fmt(pos.entry_price)}</span><br>
@@ -1059,7 +1064,7 @@ async def dashboard():
                         Now&nbsp;&nbsp;&nbsp;<span>$${markAmt.toFixed(2)}</span>
                     </div>
                     <div class="position-pnl ${pnlClass}">
-                        ${pnlSign}${pos.unrealized_pnl.toFixed(2)}<br>
+                        ${pnlSign}${upnl.toFixed(2)}<br>
                         <span style="font-size:11px;font-weight:600">${pnlSign}${roe.toFixed(2)}%</span><br>
                         <span style="font-size:10px;font-weight:400;color:var(--text-muted)">${fmt(size,4)} qty</span>
                     </div>
@@ -1089,40 +1094,61 @@ async def dashboard():
             `).join('');
         }
         
-        const PNL_NEW_POINT_INTERVAL = 30000; // push a genuinely new point every 30 s
-        let _lastPnlPointTime = 0;
-
         function updatePnLChart(data) {
             if (!pnlChart || !data.session_started) return;
 
             const now = Date.now();
             const elapsed = (now - sessionStartMs) / 3600000;
-            pnlChart.options.scales.x.max = Math.max(1, elapsed + 0.25);
+            // Snap to the next hourly tick (02:35 → 03:00)
+            const tick = Math.ceil(elapsed);
 
-            const pts = pnlChart.data.datasets[0].data;
+            let pts = pnlChart.data.datasets[0].data;
 
-            // Seed from server history only when the chart is empty (page load / reconnect).
+            // Seed from server history — bucket into hourly ticks
             if (pts.length === 0 && data.pnl_history && data.pnl_history.length > 0) {
-                pnlChart.data.datasets[0].data = data.pnl_history.map(p => ({
-                    x: (new Date(p.t).getTime() - sessionStartMs) / 3600000,
-                    y: p.pnl,
-                }));
-                _lastPnlPointTime = now;
+                const buckets = {};
+                for (const p of data.pnl_history) {
+                    const h = (new Date(p.t).getTime() - sessionStartMs) / 3600000;
+                    const t = Math.ceil(h);
+                    buckets[t] = p.pnl; // last value in each bucket wins
+                }
+                pnlChart.data.datasets[0].data = Object.entries(buckets)
+                    .sort(([a], [b]) => Number(a) - Number(b))
+                    .map(([x, y]) => ({ x: Number(x), y }));
+                pts = pnlChart.data.datasets[0].data;
             }
 
-            const livePnl = data.total_pnl ?? 0;
+            const initB = data.initial_balance || 0;
+            const livePnl = initB > 0 ? ((data.current_balance || 0) - initB) : (data.total_pnl ?? 0);
 
-            // If enough time has passed, push a new point; otherwise just
-            // update the last point's y-value so the curve adjusts smoothly
-            // without creating hundreds of clustered points between hour ticks.
-            if (pts.length > 0 && (now - _lastPnlPointTime) < PNL_NEW_POINT_INTERVAL) {
-                // Update the last point in-place
+            // Update the point at the current hourly tick in-place;
+            // push a new point only when we cross into a new hour.
+            if (pts.length > 0 && pts[pts.length - 1].x === tick) {
                 pts[pts.length - 1].y = livePnl;
             } else {
-                // New point
-                pts.push({ x: elapsed, y: livePnl });
-                _lastPnlPointTime = now;
-                if (pts.length > 600) pts.shift();
+                pts.push({ x: tick, y: livePnl });
+                if (pts.length > 100) pts.shift();
+            }
+
+            // X-axis: start from first data point, end 1 tick ahead of now
+            if (pts.length > 0) {
+                pnlChart.options.scales.x.min = Math.max(0, pts[0].x - 1);
+            }
+            pnlChart.options.scales.x.max = tick + 1;
+
+            // Adaptive x-axis tick spacing
+            const span = (tick + 1) - (pnlChart.options.scales.x.min || 0);
+            pnlChart.options.scales.x.ticks.stepSize = span > 12 ? 3 : span > 6 ? 2 : 1;
+
+            // Auto-fit Y-axis to data range with 15% padding
+            if (pts.length > 0) {
+                const ys = pts.map(p => p.y);
+                let yMin = Math.min(...ys);
+                let yMax = Math.max(...ys);
+                const range = yMax - yMin || Math.abs(yMax) * 0.1 || 1;
+                const pad = range * 0.15;
+                pnlChart.options.scales.y.min = yMin - pad;
+                pnlChart.options.scales.y.max = yMax + pad;
             }
 
             pnlChart.update('none');
@@ -1302,14 +1328,86 @@ async def dashboard():
         function initChart() {
             computeSessionStart();
             const ctx = document.getElementById('pnl-chart').getContext('2d');
+
+            // Plugin: dashed $0 reference line (only when $0 is in view)
+            const zeroLine = {
+                id: 'zeroLine',
+                afterDraw(chart) {
+                    if (chart.canvas.id !== 'pnl-chart') return;
+                    const yScale = chart.scales.y;
+                    if (yScale.min > 0 || yScale.max < 0) return;
+                    const y = yScale.getPixelForValue(0);
+                    const c = chart.ctx;
+                    const ca = chart.chartArea;
+                    c.save();
+                    c.setLineDash([6, 4]);
+                    c.strokeStyle = 'rgba(255,255,255,0.35)';
+                    c.lineWidth = 1.5;
+                    c.beginPath();
+                    c.moveTo(ca.left, y);
+                    c.lineTo(ca.right, y);
+                    c.stroke();
+                    c.restore();
+                }
+            };
+
+            // Plugin: glowing dot + value label at the current (rightmost) point
+            const currentDot = {
+                id: 'currentDot',
+                afterDraw(chart) {
+                    if (chart.canvas.id !== 'pnl-chart') return;
+                    const ds = chart.data.datasets[0];
+                    if (!ds || !ds.data || ds.data.length === 0) return;
+                    const meta = chart.getDatasetMeta(0);
+                    const el = meta.data[meta.data.length - 1];
+                    if (!el) return;
+                    const val = ds.data[ds.data.length - 1].y;
+                    const color = val >= 0 ? '#3ecf8e' : '#f05252';
+                    const glow  = val >= 0 ? 'rgba(62,207,142,0.25)' : 'rgba(240,82,82,0.25)';
+                    const px = el.x, py = el.y;
+                    const c = chart.ctx;
+                    const ca = chart.chartArea;
+                    c.save();
+                    // Outer glow
+                    c.beginPath(); c.arc(px, py, 8, 0, Math.PI * 2);
+                    c.fillStyle = glow; c.fill();
+                    // Inner dot
+                    c.beginPath(); c.arc(px, py, 4, 0, Math.PI * 2);
+                    c.fillStyle = color; c.fill();
+                    // Value label
+                    const sign = val >= 0 ? '+' : '';
+                    const label = sign + '$' + val.toFixed(2);
+                    c.font = 'bold 11px monospace';
+                    const tw = c.measureText(label).width;
+                    const pad = 4;
+                    const lx = (px + tw + 20 > ca.right) ? px - tw - 16 : px + 10;
+                    const ly = Math.max(ca.top + 14, Math.min(py, ca.bottom - 6));
+                    // Background pill
+                    const rx = lx - pad, ry = ly - 11, rw = tw + pad * 2, rh = 16, cr = 3;
+                    c.fillStyle = 'rgba(20,24,36,0.85)';
+                    c.strokeStyle = color; c.lineWidth = 1;
+                    c.beginPath();
+                    c.moveTo(rx + cr, ry);
+                    c.arcTo(rx + rw, ry, rx + rw, ry + rh, cr);
+                    c.arcTo(rx + rw, ry + rh, rx, ry + rh, cr);
+                    c.arcTo(rx, ry + rh, rx, ry, cr);
+                    c.arcTo(rx, ry, rx + rw, ry, cr);
+                    c.fill(); c.stroke();
+                    // Text
+                    c.fillStyle = color;
+                    c.fillText(label, lx, ly);
+                    c.restore();
+                }
+            };
+
             pnlChart = new Chart(ctx, {
                 type: 'line',
                 data: {
                     datasets: [{
-                        label: 'Total PnL',
+                        label: 'Session PnL',
                         data: [],
                         borderColor: '#3ecf8e',
-                        borderWidth: 2,
+                        borderWidth: 2.5,
                         tension: 0.4,
                         cubicInterpolationMode: 'monotone',
                         fill: {
@@ -1322,16 +1420,18 @@ async def dashboard():
                                 const y0 = seg.p0.parsed.y, y1 = seg.p1.parsed.y;
                                 if (y0 >= 0 && y1 >= 0) return '#3ecf8e';
                                 if (y0 <= 0 && y1 <= 0) return '#f05252';
-                                return '#aaaaaa'; // crossing segment
+                                return '#aaaaaa';
                             },
                         },
                         pointRadius: 0,
                         pointHoverRadius: 4,
                     }]
                 },
+                plugins: [zeroLine, currentDot],
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
+                    animation: false,
                     plugins: {
                         legend: { display: false },
                         tooltip: {
@@ -1355,11 +1455,10 @@ async def dashboard():
                             ticks: {
                                 stepSize: 1,
                                 color: '#616b82',
-                                // Show every elapsed integer hour as HH:00
                                 callback: (v) => {
                                     if (!Number.isInteger(v)) return '';
-                                    const elapsed = (Date.now() - sessionStartMs) / 3600000;
-                                    return v <= Math.floor(elapsed) ? sessionHoursToLabel(v) : '';
+                                    const tick = Math.ceil((Date.now() - sessionStartMs) / 3600000);
+                                    return v <= tick ? sessionHoursToLabel(v) : '';
                                 },
                                 autoSkip: false,
                                 maxRotation: 0,
@@ -1367,11 +1466,11 @@ async def dashboard():
                             grid: { color: '#232838' },
                         },
                         y: {
-                            ticks: { color: '#616b82' },
-                            grid: {
-                                color: (ctx) => ctx.tick.value === 0 ? 'rgba(255,255,255,0.55)' : '#232838',
-                                lineWidth: (ctx) => ctx.tick.value === 0 ? 2 : 1,
+                            ticks: {
+                                color: '#616b82',
+                                callback: (v) => '$' + v.toFixed(2),
                             },
+                            grid: { color: '#232838' },
                         }
                     }
                 }
