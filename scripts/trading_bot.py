@@ -160,6 +160,7 @@ class TradingBot:
         # Today's PnL baseline (resets at midnight, independent of session rescreening)
         self._today_date: str = ""
         self._today_initial_balance: float = 0.0
+        self._realized_pnl_today: float = 0.0  # sum of closed-trade PnL today only
 
         # LSTM state buffer — matches environment.state_buffer
         self.lstm_enabled = self.agent.lstm_enabled
@@ -820,7 +821,7 @@ class TradingBot:
         trades_norm = self.daily_trades / max(self.max_daily_trades, 1)
 
         # 5. Daily loss used (negative pnl_today / max loss)
-        loss_norm = float(np.clip(max(0.0, -pnl_today) / max(self._daily_loss_limit, 1.0), 0.0, 1.0))
+        loss_norm = float(np.clip(max(0.0, -self._realized_pnl_today) / max(self._daily_loss_limit, 1.0), 0.0, 1.0))
 
         return np.array([
             float(np.clip(cooldown_norm,      0, 1)),
@@ -858,7 +859,7 @@ class TradingBot:
 
         # Circuit breaker: if daily loss >= max, only HOLD/CLOSE allowed
         pnl_today = (self.current_balance or 0.0) - self.initial_balance
-        circuit_breaker = (self.initial_balance > 0) and (-pnl_today >= self._daily_loss_limit)
+        circuit_breaker = (self.initial_balance > 0) and (-self._realized_pnl_today >= self._daily_loss_limit)
         trade_limit_hit = self.daily_trades >= self.max_daily_trades
 
         can_open = (
@@ -1108,8 +1109,8 @@ class TradingBot:
                 today_str = datetime.now().strftime("%Y-%m-%d")
                 if today_str != self._today_date:
                     self._today_date = today_str
-                    # Use wallet baseline (initial_balance was set from get_balance/wallet)
                     self._today_initial_balance = self.initial_balance
+                    self._realized_pnl_today = 0.0  # fresh day — reset realized counter
                 today_pnl = current_balance - self._today_initial_balance
 
                 # Track peak balance for drawdown computation
@@ -1119,7 +1120,7 @@ class TradingBot:
                     self._peak_balance = max(self._peak_balance, current_balance)
 
                 # -- Daily Loss Limit ------------------------------------------
-                if pnl_today <= -self._daily_loss_limit:
+                if self._realized_pnl_today <= -self._daily_loss_limit:
                     now_iso = datetime.now().isoformat()
                     # Close each position individually and log actual outcome
                     for sym in list(self.executor.positions.keys()):
@@ -1302,6 +1303,10 @@ class TradingBot:
                     trade_symbol, trade_side, trade_pnl = "", "", 0.0
 
                 new_count = self.executor.get_position_info()["count"]
+
+                # Accumulate realized PnL (closes only — trade_pnl is 0 on opens)
+                if trade_pnl != 0.0:
+                    self._realized_pnl_today += trade_pnl
 
                 if trade_symbol and new_count != old_count:
                     self.daily_trades += 1
