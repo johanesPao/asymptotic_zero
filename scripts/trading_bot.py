@@ -16,9 +16,10 @@ import sys
 from pathlib import Path
 import random
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import numpy as np
 import faulthandler
+import pytz
 
 faulthandler.enable()  # dump Python traceback on SIGABRT / SIGSEGV
 
@@ -29,6 +30,7 @@ sys.path.insert(0, str(project_root))
 from src.utils.log_setup import get_logger
 
 _log = get_logger("trading")
+WIB = pytz.timezone("Asia/Jakarta")
 
 from src.config.secrets import get_secret
 from binance.client import Client
@@ -64,7 +66,7 @@ class _DashboardLogHandler(logging.Handler):
         source = record.name.split(".")[-1]
         message = self.format(record)
         self._records.append({
-            "time": datetime.fromtimestamp(record.created).strftime("%H:%M:%S"),
+            "time": datetime.fromtimestamp(record.created, WIB).strftime("%H:%M:%S"),
             "level": record.levelname,
             "source": source,
             "message": message,
@@ -321,6 +323,59 @@ class TradingBot:
         if self.current_session_key:
             self.logger.log_activity(self.current_session_key, message)
 
+    def _record_close_to_db(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        exit_price: float,
+        pnl: float,
+        pnl_pct: float,
+        portfolio_value: float,
+        action_id: int = 0,
+    ) -> None:
+        """Record a position close to the DB trades table.
+
+        Handles both cases: position was opened in this session (has a trade key
+        in open_trade_keys) or was inherited from a prior session / Binance sync
+        (no trade key — creates a standalone close record).
+        """
+        if not self.current_session_key:
+            return
+        try:
+            trade_key = self.open_trade_keys.pop(symbol, None)
+            if trade_key:
+                self.logger.log_trade_close(
+                    trade_key=trade_key,
+                    exit_price=exit_price,
+                    pnl=pnl,
+                    pnl_percent=pnl_pct,
+                )
+            else:
+                # No matching open record — create a standalone close entry
+                all_symbols = (
+                    (self.current_coins or {}).get("gainers", [])
+                    + (self.current_coins or {}).get("losers", [])
+                )
+                coin_rank = all_symbols.index(symbol) if symbol in all_symbols else 0
+                is_gainer = coin_rank < 10
+                open_count = self.executor.get_position_info()["count"]
+                self.logger.log_trade_close_standalone(
+                    session_key=self.current_session_key,
+                    symbol=symbol,
+                    side=side,
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    pnl=pnl,
+                    pnl_percent=pnl_pct,
+                    portfolio_value=portfolio_value,
+                    open_positions=open_count,
+                    coin_rank=coin_rank,
+                    is_gainer=is_gainer,
+                )
+        except Exception as e:
+            _log.error(f"DB _record_close_to_db failed for {symbol}: {e}")
+
     def _write_metrics(
         self,
         step: int,
@@ -566,7 +621,7 @@ class TradingBot:
                         "exit_price": round(result.get("exit_price", 0.0), 6),
                         "pnl": round(result["pnl"], 4),
                         "pnl_pct": round(result.get("pnl_pct", 0.0), 2),
-                        "timestamp": datetime.now().isoformat(),
+                        "timestamp": datetime.now(WIB).isoformat(),
                     })
                     if len(self._recent_trades) > 20:
                         self._recent_trades = self._recent_trades[-20:]
@@ -615,7 +670,7 @@ class TradingBot:
                         "exit_price": round(result.get("exit_price", 0.0), 6),
                         "pnl": round(result["pnl"], 4),
                         "pnl_pct": round(result.get("pnl_pct", 0.0), 2),
-                        "timestamp": datetime.now().isoformat(),
+                        "timestamp": datetime.now(WIB).isoformat(),
                     })
                     if len(self._recent_trades) > 20:
                         self._recent_trades = self._recent_trades[-20:]
@@ -624,28 +679,88 @@ class TradingBot:
 
             case 61:
                 # CLOSE_ALL bypasses guardrails (emergency exit)
-                # Snapshot positions before closing so we can log each symbol
+                # Close each position individually so we capture PnL
                 positions_snapshot = dict(self.executor.positions)
-                self.executor.close_all_positions()
+                now = datetime.now(WIB).isoformat()
+                for sym, pos in positions_snapshot.items():
+                    result = self.executor.close_position(sym)
+                    if result:
+                        self.guardrails.record_position_closed(sym)
+                        self._log_activity(f"CLOSE_ALL: {sym} ({pos['side']}) closed → PnL {result['pnl']:+.2f}")
+                        self._recent_trades.append({
+                            "symbol": sym,
+                            "side": result["side"],
+                            "entry_price": round(result.get("entry_price", 0.0), 6),
+                            "exit_price": round(result.get("exit_price", 0.0), 6),
+                            "pnl": round(result["pnl"], 4),
+                            "pnl_pct": round(result.get("pnl_pct", 0.0), 2),
+                            "timestamp": now,
+                        })
+                        self._record_close_to_db(
+                            symbol=sym,
+                            side=result.get("side", pos["side"]),
+                            entry_price=result.get("entry_price", pos.get("entry_price", 0.0)),
+                            exit_price=result.get("exit_price", 0.0),
+                            pnl=result["pnl"],
+                            pnl_pct=result.get("pnl_pct", 0.0),
+                            portfolio_value=balance,
+                            action_id=61,
+                        )
+                    else:
+                        self._log_activity(f"CLOSE_ALL: {sym} ({pos['side']}) FAILED to close")
                 for symbol in list(self.guardrails.position_history.keys()):
                     self.guardrails.record_position_closed(symbol)
-                now = datetime.now().isoformat()
-                for sym, pos in positions_snapshot.items():
-                    self._log_activity(f"CLOSE_ALL: {sym} ({pos['side']}) closed")
-                    self._recent_trades.append({
-                        "symbol": sym,
-                        "side": pos["side"],
-                        "entry_price": round(pos.get("entry_price", 0.0), 6),
-                        "exit_price": 0.0,
-                        "pnl": 0.0,
-                        "pnl_pct": 0.0,
-                        "timestamp": now,
-                    })
                 if len(self._recent_trades) > 20:
                     self._recent_trades = self._recent_trades[-20:]
                 return "ALL", "CLOSE", 0.0
 
             case 62:
+                # CLOSE_WORST
+                positions = self.executor.positions
+                if not positions:
+                    return "", "", 0.0
+
+                worst_symbol = None
+                worst_pnl = float("inf")
+
+                for symbol, pos in positions.items():
+                    try:
+                        current_price = self.executor.get_current_price(symbol)
+                        entry = pos["entry_price"]
+                        size = pos["size"]
+                        if pos["side"] == "LONG":
+                            unpnl = (current_price - entry) * size
+                        else:
+                            unpnl = (entry - current_price) * size
+                    except Exception as e:
+                        _log.warning(
+                            f"Failed to get price for {symbol} during CLOSE_WORST: {e}"
+                        )
+                        unpnl = 0.0  # assume breakeven so we still consider it
+
+                    if unpnl < worst_pnl:
+                        worst_pnl = unpnl
+                        worst_symbol = symbol
+
+                if worst_symbol:
+                    result = self.executor.close_position(worst_symbol)
+                    if result:
+                        self.guardrails.record_position_closed(worst_symbol)
+                        self._last_close_exit_prices[worst_symbol] = result.get(
+                            "exit_price", 0.0
+                        )
+                        self._recent_trades.append({
+                            "symbol": worst_symbol,
+                            "side": result["side"],
+                            "entry_price": round(result.get("entry_price", 0.0), 6),
+                            "exit_price": round(result.get("exit_price", 0.0), 6),
+                            "pnl": round(result["pnl"], 4),
+                            "pnl_pct": round(result.get("pnl_pct", 0.0), 2),
+                            "timestamp": datetime.now(WIB).isoformat(),
+                        })
+                        if len(self._recent_trades) > 20:
+                            self._recent_trades = self._recent_trades[-20:]
+                        return worst_symbol, result["side"], result["pnl"]
                 return "", "", 0.0
 
             case _:
@@ -1034,7 +1149,7 @@ class TradingBot:
         """Sit out the rest of the current 5-minute interval."""
         if reason:
             _log.info(f"Waiting for next interval: {reason}")
-        now = datetime.now()
+        now = datetime.now(WIB)
         seconds_into_interval = (now.minute % 5) * 60 + now.second
         seconds_to_wait = max(300 - seconds_into_interval, 10)
         time.sleep(seconds_to_wait)
@@ -1049,15 +1164,15 @@ class TradingBot:
 
         while True:
             try:
-                current_date = datetime.now().date()
-                current_hour = datetime.now().hour
+                now_wib = datetime.now(WIB)
+                current_date = now_wib.date()
+                current_hour = now_wib.hour
 
                 # -- Morning Screening -----------------------------------------
-                now = datetime.now()
                 is_7am_window = current_hour == 7
                 already_screened_this_hour = (
                     last_screening_time is not None
-                    and now - last_screening_time < timedelta(hours=1)
+                    and now_wib - last_screening_time < timedelta(hours=1)
                 )
                 should_screen = last_screening_time is None or (
                     is_7am_window and not already_screened_this_hour
@@ -1090,6 +1205,15 @@ class TradingBot:
                                 self._log_activity(
                                     f"Re-screening: closed {sym} ({pos['side']})"
                                     + f" → PnL {result['pnl']:+.2f}"
+                                )
+                                self._record_close_to_db(
+                                    symbol=sym,
+                                    side=result.get("side", pos["side"]),
+                                    entry_price=result.get("entry_price", pos.get("entry_price", 0.0)),
+                                    exit_price=result.get("exit_price", 0.0),
+                                    pnl=result["pnl"],
+                                    pnl_pct=result.get("pnl_pct", 0.0),
+                                    portfolio_value=self.initial_balance,
                                 )
                             else:
                                 self._log_activity(
@@ -1174,9 +1298,9 @@ class TradingBot:
                     )
                     self._dashboard_log_handler.set_logger(self.logger, self.current_session_key)
                     self.open_trade_keys = {}
-                    self._session_started = datetime.now().isoformat()
+                    self._session_started = now_wib.isoformat()
 
-                    last_screening_time = now
+                    last_screening_time = now_wib
                     step = 0
 
                     gainers_str = " ".join(self.current_coins["gainers"][:10])
@@ -1193,7 +1317,7 @@ class TradingBot:
                     all_screened = set(
                         self.current_coins["gainers"] + self.current_coins["losers"]
                     )
-                    now_iso = datetime.now().isoformat()
+                    now_iso = now_wib.isoformat()
                     for sym, pos in list(self.executor.positions.items()):
                         if sym not in all_screened:
                             result = self.executor.close_position(sym)
@@ -1258,7 +1382,7 @@ class TradingBot:
                 # Today's PnL: resets at midnight using same wallet baseline as session.
                 # _today_initial_balance holds wallet at start-of-day (not equity),
                 # so today_pnl = equity_now - wallet_at_day_start = unrealized + realized.
-                today_str = datetime.now().strftime("%Y-%m-%d")
+                today_str = now_wib.strftime("%Y-%m-%d")
                 if today_str != self._today_date:
                     self._today_date = today_str
                     self._today_initial_balance = self.initial_balance
@@ -1273,7 +1397,7 @@ class TradingBot:
 
                 # -- Daily Loss Limit ------------------------------------------
                 if self._realized_pnl_today <= -self._daily_loss_limit:
-                    now_iso = datetime.now().isoformat()
+                    now_iso = now_wib.isoformat()
                     # Close each position individually and log actual outcome
                     for sym in list(self.executor.positions.keys()):
                         pos = self.executor.positions.get(sym)
@@ -1294,6 +1418,15 @@ class TradingBot:
                                 "pnl_pct": round(result.get("pnl_pct", 0.0), 2),
                                 "timestamp": now_iso,
                             })
+                            self._record_close_to_db(
+                                symbol=sym,
+                                side=result.get("side", pos["side"]),
+                                entry_price=result.get("entry_price", pos.get("entry_price", 0.0)),
+                                exit_price=result.get("exit_price", 0.0),
+                                pnl=result["pnl"],
+                                pnl_pct=result.get("pnl_pct", 0.0),
+                                portfolio_value=current_balance,
+                            )
                         else:
                             self._log_activity(
                                 f"Daily loss limit hit: FAILED to close {sym} ({pos['side']})"
@@ -1361,7 +1494,7 @@ class TradingBot:
                     ]
                     while True:
                         time.sleep(300)
-                        now = datetime.now()
+                        now = datetime.now(WIB)
                         resume_in = f"resumes at 07:00 ({(7 - now.hour) % 24}h away)"
                         msg = random.choice(_heartbeat_msgs)
                         self.logger.update_heartbeat({
@@ -1521,25 +1654,25 @@ class TradingBot:
                             if len(self._step_pnls) > 100:
                                 self._step_pnls = self._step_pnls[-100:]
 
-                        # Position closed: update the open trade row
-                        try:
-                            trade_key = self.open_trade_keys.pop(trade_symbol, None)
-                            exit_price = self._last_close_exit_prices.pop(
-                                trade_symbol, 0.0
-                            )
-                            if trade_key:
-                                self.logger.log_trade_close(
-                                    trade_key=trade_key,
-                                    exit_price=exit_price,
-                                    pnl=trade_pnl,
-                                    pnl_percent=(
-                                        (trade_pnl / current_balance * 100)
-                                        if current_balance > 0
-                                        else 0.0
-                                    ),
-                                )
-                        except Exception as e:
-                            _log.error(f"DB log_trade_close failed: {e}")
+                        # Position closed: record to DB
+                        exit_price = self._last_close_exit_prices.pop(
+                            trade_symbol, 0.0
+                        )
+                        pnl_pct = (
+                            (trade_pnl / current_balance * 100)
+                            if current_balance > 0
+                            else 0.0
+                        )
+                        self._record_close_to_db(
+                            symbol=trade_symbol,
+                            side=trade_side,
+                            entry_price=0.0,
+                            exit_price=exit_price,
+                            pnl=trade_pnl,
+                            pnl_pct=pnl_pct,
+                            portfolio_value=current_balance,
+                            action_id=action,
+                        )
 
                 # -- Write state for web dashboard --------------------------------
                 if trade_symbol and trade_symbol != "ALL":
@@ -1559,7 +1692,7 @@ class TradingBot:
                 self._write_metrics(step, current_balance, action_str, avg_q, today_pnl)
 
                 # -- Countdown -------------------------------------------------
-                now = datetime.now()
+                now = datetime.now(WIB)
                 seconds_into_interval = (now.minute % 5) * 60 + now.second
                 seconds_to_wait = 300 - seconds_into_interval
                 time.sleep(seconds_to_wait)

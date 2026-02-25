@@ -28,7 +28,7 @@ import logging
 import queue
 import threading
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -105,13 +105,13 @@ class TradingLogger:
         passed to subsequent calls.  The actual DB id is looked up by the
         background thread when it processes the event.
         """
-        session_key = datetime.utcnow().isoformat()
+        session_key = datetime.now(timezone.utc).isoformat()
         self._enqueue("open_session", {
             "session_key": session_key,
             "mode": mode,
             "initial_balance": initial_balance,
             "screened_coins": screened_coins,
-            "screening_time": datetime.utcnow(),
+            "screening_time": datetime.now(timezone.utc),
         })
         return session_key
 
@@ -134,7 +134,7 @@ class TradingLogger:
 
         Returns a trade_key (timestamp string) for later update on close.
         """
-        trade_key = f"{symbol}_{datetime.utcnow().isoformat()}"
+        trade_key = f"{symbol}_{datetime.now(timezone.utc).isoformat()}"
         self._enqueue("trade_open", {
             "trade_key": trade_key,
             "session_key": session_key,
@@ -148,7 +148,7 @@ class TradingLogger:
             "avg_q": avg_q,
             "coin_rank": coin_rank,
             "is_gainer": is_gainer,
-            "timestamp": datetime.utcnow(),
+            "timestamp": datetime.now(timezone.utc),
         })
         return trade_key
 
@@ -165,7 +165,41 @@ class TradingLogger:
             "exit_price": exit_price,
             "pnl": pnl,
             "pnl_percent": pnl_percent,
-            "closed_at": datetime.utcnow(),
+            "closed_at": datetime.now(timezone.utc),
+        })
+
+    def log_trade_close_standalone(
+        self,
+        session_key: str,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        exit_price: float,
+        pnl: float,
+        pnl_percent: float = 0.0,
+        portfolio_value: float = 0.0,
+        open_positions: int = 0,
+        coin_rank: int = 0,
+        is_gainer: bool = True,
+    ):
+        """Insert a Trade row for a close that has no matching open record.
+
+        Used for positions inherited from a prior session, closed during
+        re-screening, or closed by the daily loss limit.
+        """
+        self._enqueue("trade_close_standalone", {
+            "session_key": session_key,
+            "symbol": symbol,
+            "side": side,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "pnl": pnl,
+            "pnl_percent": pnl_percent,
+            "portfolio_value": portfolio_value,
+            "open_positions": open_positions,
+            "coin_rank": coin_rank,
+            "is_gainer": is_gainer,
+            "timestamp": datetime.now(timezone.utc),
         })
 
     def close_session(
@@ -189,7 +223,7 @@ class TradingLogger:
             "losing_trades": losing_trades,
             "daily_limit_hit": daily_limit_hit,
             "stop_reason": stop_reason,
-            "trading_end": datetime.utcnow(),
+            "trading_end": datetime.now(timezone.utc),
         })
 
     def log_event(
@@ -209,7 +243,7 @@ class TradingLogger:
             "session_key": session_key,
             "exception": exception,
             "extra_data": extra_data or {},
-            "timestamp": datetime.utcnow(),
+            "timestamp": datetime.now(timezone.utc),
         })
 
     def log_activity(self, session_key: str, message: str):
@@ -217,7 +251,7 @@ class TradingLogger:
         self._enqueue("activity_log", {
             "session_key": session_key,
             "message": message,
-            "timestamp": datetime.utcnow(),
+            "timestamp": datetime.now(timezone.utc),
         })
 
     def log_pnl_snapshot(self, session_key: str, equity: float, pnl: float):
@@ -226,7 +260,7 @@ class TradingLogger:
             "session_key": session_key,
             "equity": equity,
             "pnl": pnl,
-            "timestamp": datetime.utcnow(),
+            "timestamp": datetime.now(timezone.utc),
         })
 
     def update_heartbeat(self, data: Dict):
@@ -314,6 +348,10 @@ class TradingLogger:
                         tid = trade_id_map.get(payload["trade_key"])
                         if tid:
                             self._write_trade_close(db, payload, tid)
+
+                    elif event_type == "trade_close_standalone":
+                        sid = session_id_map.get(payload["session_key"])
+                        self._write_trade_close_standalone(db, payload, sid)
 
                     elif event_type == "close_session":
                         sid = session_id_map.get(payload["session_key"])
@@ -418,6 +456,26 @@ class TradingLogger:
         trade.action_type = "close"
         db.commit()
 
+    def _write_trade_close_standalone(self, db, p: Dict, session_id: Optional[int]):
+        """INSERT a close Trade row when no matching open record exists."""
+        trade = Trade(
+            session_id=session_id,
+            timestamp=p["timestamp"],
+            symbol=p["symbol"],
+            side=p["side"],
+            action_type="close",
+            entry_price=p["entry_price"],
+            exit_price=p["exit_price"],
+            pnl=p["pnl"],
+            pnl_percent=p["pnl_percent"],
+            portfolio_value=p["portfolio_value"],
+            open_positions=p["open_positions"],
+            coin_rank=p["coin_rank"],
+            is_gainer=p["is_gainer"],
+        )
+        db.add(trade)
+        db.commit()
+
     def _write_close_session(self, db, p: Dict, session_id: int):
         """UPDATE sessions with end-of-day summary."""
         session = db.query(Session).filter(Session.id == session_id).first()
@@ -480,7 +538,7 @@ class TradingLogger:
 
     def _write_heartbeat(self, db, p: Dict):
         """UPSERT into bot_heartbeat (bot_id='main')."""
-        p["last_updated"] = datetime.utcnow()
+        p["last_updated"] = datetime.now(timezone.utc)
 
         # Convert session_started from ISO string to datetime if needed
         if "session_started" in p and isinstance(p["session_started"], str):
@@ -510,5 +568,5 @@ class TradingLogger:
         row = db.query(BotHeartbeat).filter(BotHeartbeat.bot_id == "main").first()
         if row:
             row.status = "offline"
-            row.last_updated = datetime.utcnow()
+            row.last_updated = datetime.now(timezone.utc)
             db.commit()

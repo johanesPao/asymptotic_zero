@@ -13,7 +13,7 @@ Tables:
 - bot_heartbeat:  Single-row UPSERT — "what is the bot doing now?"
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import (
     create_engine,
     Column,
@@ -55,8 +55,8 @@ class Session(Base):
     losing_trades = Column(Integer, default=0)
     daily_limit_hit = Column(Boolean, default=False)
     stop_reason = Column(String(200))
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
-    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     # Relationships
     trades = relationship("Trade", back_populates="session", cascade="all, delete-orphan")
@@ -89,7 +89,7 @@ class Trade(Base):
     agent_q_value = Column(Float)
     portfolio_value = Column(Float)
     open_positions = Column(SmallInteger)
-    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     # Relationships
     session = relationship("Session", back_populates="trades")
@@ -110,7 +110,7 @@ class ActivityLog(Base):
 
     id = Column(Integer, primary_key=True)
     session_id = Column(Integer, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
-    timestamp = Column(DateTime(timezone=True), default=datetime.utcnow)
+    timestamp = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     message = Column(Text, nullable=False)
 
     # Relationships
@@ -127,7 +127,7 @@ class SystemLog(Base):
 
     id = Column(Integer, primary_key=True)
     session_id = Column(Integer, ForeignKey("sessions.id", ondelete="SET NULL"), index=True)
-    timestamp = Column(DateTime(timezone=True), default=datetime.utcnow, index=True)
+    timestamp = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
     level = Column(String(10), nullable=False, index=True)
     source = Column(String(50), nullable=False)
     message = Column(Text, nullable=False)
