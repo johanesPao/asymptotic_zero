@@ -32,10 +32,7 @@ _log = get_logger("trading")
 
 from src.config.secrets import get_secret
 from binance.client import Client
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
 
-from src.database.models import TradingSession, SystemLog
 from src.database.logger import TradingLogger
 from src.trading.screening import get_top_movers
 from src.trading.market_data import fetch_all_coins
@@ -50,22 +47,44 @@ from src.trading.guardrails import GuardrailManager
 
 
 class _DashboardLogHandler(logging.Handler):
-    """Captures recent WARNING/ERROR log records for the web dashboard."""
+    """Captures recent WARNING/ERROR log records for the web dashboard and persists to DB."""
 
     def __init__(self, maxlen: int = 50):
         super().__init__(level=logging.WARNING)
         self._records: list = []
         self._maxlen = maxlen
+        self._logger: TradingLogger | None = None
+        self._session_key: str = ""
+
+    def set_logger(self, logger: TradingLogger, session_key: str = "") -> None:
+        self._logger = logger
+        self._session_key = session_key
 
     def emit(self, record: logging.LogRecord) -> None:
+        source = record.name.split(".")[-1]
+        message = self.format(record)
         self._records.append({
             "time": datetime.fromtimestamp(record.created).strftime("%H:%M:%S"),
             "level": record.levelname,
-            "source": record.name.split(".")[-1],
-            "message": self.format(record),
+            "source": source,
+            "message": message,
         })
         if len(self._records) > self._maxlen:
             self._records = self._records[-self._maxlen:]
+
+        # Persist to DB
+        if self._logger is not None:
+            import traceback as _tb
+            exc_text = ""
+            if record.exc_info and record.exc_info[1]:
+                exc_text = "".join(_tb.format_exception(*record.exc_info))
+            self._logger.log_event(
+                level=record.levelname,
+                source=source,
+                message=message,
+                session_key=self._session_key,
+                exception=exc_text,
+            )
 
     @property
     def entries(self) -> list:
@@ -104,12 +123,6 @@ class TradingBot:
 
         print(f"✅ Connected to Binance {self.trading_mode}")
 
-        # Initialize database
-        self.engine = create_engine(self.db_url)
-        self.Session = sessionmaker(bind=self.engine)
-
-        print("✅ Connected to database")
-
         # Initialize trading logger HERE — before importing TensorFlow.
         # TradingLogger.__init__ calls _warmup_connection() which makes the
         # very first psycopg2.connect() call, initialising libpq + its OpenSSL.
@@ -130,6 +143,7 @@ class TradingBot:
 
         # System error log — captures WARNING/ERROR from ALL Python loggers
         self._dashboard_log_handler = _DashboardLogHandler(maxlen=50)
+        self._dashboard_log_handler.set_logger(self.logger)
         logging.getLogger().addHandler(self._dashboard_log_handler)
 
         print("✅ DB logger initialized (libpq/OpenSSL warmed up)")
@@ -296,13 +310,16 @@ class TradingBot:
             _log.error(message, extra=extra_data or {})
 
     def _log_activity(self, message: str) -> None:
-        """Append a timestamped event to the rolling activity log."""
+        """Append a timestamped event to the rolling activity log and persist to DB."""
         self._activity_log.append({
             "time": datetime.now().strftime("%H:%M:%S"),
             "message": message,
         })
         if len(self._activity_log) > 50:
             self._activity_log = self._activity_log[-50:]
+        # Persist to DB
+        if self.current_session_key:
+            self.logger.log_activity(self.current_session_key, message)
 
     def _write_metrics(
         self,
@@ -313,35 +330,18 @@ class TradingBot:
         today_pnl: float = 0.0,
         record_history: bool = True,
     ) -> None:
-        """Write live bot state to live_trading_metrics.json for the web dashboard."""
+        """Push live bot state to bot_heartbeat (DB) for the web dashboard."""
         try:
-            import json
-
-            positions = self._get_enriched_positions()
-            pos_list = [
-                {
-                    "symbol": sym,
-                    "side": pos["side"],
-                    "size": float(pos["size"]),
-                    "entry_price": float(pos["entry_price"]),
-                    "unrealized_pnl": float(pos.get("unrealized_pnl", 0.0)),
-                    "leverage": int(pos.get("leverage", 10)),
-                }
-                for sym, pos in positions.items()
-            ]
-
             winning = self.winning_trades
             losing = self.losing_trades
-            total = winning + losing
             g_status = self.guardrails.get_status()
 
-            if record_history:
-                self._pnl_history.append({
-                    "t": datetime.now().isoformat(),
-                    "pnl": float(current_balance - self.initial_balance),
-                })
-                if len(self._pnl_history) > 300:
-                    self._pnl_history = self._pnl_history[-300:]
+            # PnL snapshot — one per step when record_history is True
+            if record_history and self.current_session_key:
+                pnl = float(current_balance - self.initial_balance)
+                self.logger.log_pnl_snapshot(
+                    self.current_session_key, float(current_balance), pnl,
+                )
 
             # Build per-coin table for web dashboard
             coin_table = []
@@ -409,42 +409,29 @@ class TradingBot:
             except Exception as e:
                 _log.warning(f"coin_table build failed: {e}")
 
-            data = {
+            self.logger.update_heartbeat({
+                "session_key": self.current_session_key,
                 "status": "running",
                 "session_started": self._session_started,
-                "current_balance": float(current_balance),
-                "initial_balance": float(self.initial_balance),
-                "total_pnl": float(current_balance - self.initial_balance),
-                "today_pnl": float(today_pnl),
-                "win_rate": winning / total if total > 0 else 0.0,
-                "trade_count": self.daily_trades,
-                "current_positions": pos_list,
-                "recent_trades": list(reversed(self._recent_trades[-20:])),
                 "agent_status": "active",
                 "epsilon": float(self.agent.epsilon),
                 "current_step": step,
                 "last_action": action_str,
                 "avg_q": float(avg_q),
-                "screened_coins": self.current_coins,
+                "current_balance": float(current_balance),
+                "initial_balance": float(self.initial_balance),
+                "trade_count": self.daily_trades,
+                "winning_trades": winning,
+                "losing_trades": losing,
                 "guardrail_status": {
                     "cooldown_remaining": int(g_status["cooldown_remaining"]),
                     "daily_trades": self.daily_trades,
                     "daily_pnl": float(current_balance - self.initial_balance),
                 },
-                "activity_log": list(reversed(self._activity_log)),
-                "error_log": list(reversed(self._dashboard_log_handler.entries)),
-                "pnl_history": list(self._pnl_history),
                 "coin_table": coin_table,
+                "screened_coins": self.current_coins,
                 "trading_mode": self.trading_mode,
-                "last_updated": datetime.now().isoformat(),
-            }
-
-            log_dir = Path("logs/trading")
-            log_dir.mkdir(parents=True, exist_ok=True)
-            tmp = log_dir / "live_trading_metrics.tmp"
-            with open(tmp, "w") as f:
-                json.dump(data, f)
-            tmp.rename(log_dir / "live_trading_metrics.json")
+            })
         except Exception as e:
             _log.error(f"_write_metrics failed: {e}")
 
@@ -1185,6 +1172,7 @@ class TradingBot:
                         initial_balance=self.initial_balance,
                         screened_coins=self.current_coins,
                     )
+                    self._dashboard_log_handler.set_logger(self.logger, self.current_session_key)
                     self.open_trade_keys = {}
                     self._session_started = datetime.now().isoformat()
 
@@ -1376,12 +1364,18 @@ class TradingBot:
                         now = datetime.now()
                         resume_in = f"resumes at 07:00 ({(7 - now.hour) % 24}h away)"
                         msg = random.choice(_heartbeat_msgs)
-                        self._write_metrics(
-                            step, current_balance,
-                            f"{msg} — {resume_in}",
-                            0.0, pnl_today,
-                            record_history=False,
-                        )
+                        self.logger.update_heartbeat({
+                            "session_key": self.current_session_key,
+                            "status": "sleeping",
+                            "last_action": f"{msg} — {resume_in}",
+                            "current_balance": float(current_balance),
+                            "initial_balance": float(self.initial_balance),
+                            "current_step": step,
+                            "trade_count": self.daily_trades,
+                            "winning_trades": self.winning_trades,
+                            "losing_trades": self.losing_trades,
+                            "trading_mode": self.trading_mode,
+                        })
                         if now.hour == 7 and (
                             last_screening_time is None
                             or now - last_screening_time > timedelta(hours=1)
@@ -1602,6 +1596,7 @@ class TradingBot:
                 winning_trades=self.winning_trades,
                 losing_trades=self.losing_trades,
             )
+        self.logger.mark_offline()
         self.logger.shutdown(timeout=5.0)
         print("Done.")
 

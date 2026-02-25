@@ -15,7 +15,11 @@ Usage (in trading_bot.py):
     session_id = logger.open_session(mode, initial_balance, screened_coins)
     trade_id   = logger.log_trade_open(session_id, symbol, side, entry_price, ...)
     logger.log_trade_close(trade_id, exit_price, pnl)
+    logger.log_activity(session_key, message)
+    logger.log_pnl_snapshot(session_key, equity, pnl)
+    logger.update_heartbeat(data_dict)
     logger.close_session(session_id, final_balance, ...)
+    logger.mark_offline()
     logger.shutdown()   # call on bot exit — waits up to 5s to flush queue
 """
 
@@ -32,7 +36,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
-from src.database.models import TradingSession, Trade, SystemLog, Base
+from src.database.models import Session, Trade, ActivityLog, SystemLog, PnLSnapshot, BotHeartbeat, Base
 from src.utils.log_setup import get_logger
 
 # File logger for DB errors — daily rotation, 30-day retention
@@ -76,9 +80,6 @@ class TradingLogger:
         # Pre-warm libpq/OpenSSL in the MAIN thread before any background
         # threads or Binance HTTPS calls start.  libpq links against OpenSSL
         # and must finish its one-time initialisation single-threadedly.
-        # If the background writer thread does this first connect() at the
-        # same time as the main thread opens an HTTPS socket, both sides race
-        # to initialise OpenSSL → heap corruption → free(): invalid pointer.
         self._warmup_connection()
 
         # Start background writer thread
@@ -98,7 +99,7 @@ class TradingLogger:
         screened_coins: Dict,
     ) -> str:
         """
-        Create a new TradingSession row.
+        Create a new Session row.
 
         Returns a client-side session_key (datetime string) that can be
         passed to subsequent calls.  The actual DB id is looked up by the
@@ -178,7 +179,7 @@ class TradingLogger:
         daily_limit_hit: bool = False,
         stop_reason: str = "",
     ):
-        """Update TradingSession with end-of-day summary."""
+        """Update Session with end-of-day summary."""
         self._enqueue("close_session", {
             "session_key": session_key,
             "final_balance": final_balance,
@@ -188,28 +189,53 @@ class TradingLogger:
             "losing_trades": losing_trades,
             "daily_limit_hit": daily_limit_hit,
             "stop_reason": stop_reason,
-            "trading_end_time": datetime.utcnow(),
+            "trading_end": datetime.utcnow(),
         })
 
     def log_event(
         self,
         level: str,
-        category: str,
+        source: str,
         message: str,
         session_key: str = "",
         exception: str = "",
         extra_data: Dict = None,
     ):
-        """Insert a SystemLog row (INFO / WARNING / ERROR / CRITICAL)."""
+        """Insert a SystemLog row (WARNING / ERROR / CRITICAL)."""
         self._enqueue("system_log", {
             "level": level,
-            "category": category,
+            "source": source,
             "message": message,
             "session_key": session_key,
             "exception": exception,
             "extra_data": extra_data or {},
             "timestamp": datetime.utcnow(),
         })
+
+    def log_activity(self, session_key: str, message: str):
+        """Insert an ActivityLog row."""
+        self._enqueue("activity_log", {
+            "session_key": session_key,
+            "message": message,
+            "timestamp": datetime.utcnow(),
+        })
+
+    def log_pnl_snapshot(self, session_key: str, equity: float, pnl: float):
+        """Insert a PnLSnapshot row."""
+        self._enqueue("pnl_snapshot", {
+            "session_key": session_key,
+            "equity": equity,
+            "pnl": pnl,
+            "timestamp": datetime.utcnow(),
+        })
+
+    def update_heartbeat(self, data: Dict):
+        """UPSERT the bot_heartbeat row (bot_id='main')."""
+        self._enqueue("heartbeat", data)
+
+    def mark_offline(self):
+        """Set heartbeat status to 'offline'. Call before shutdown()."""
+        self._enqueue("mark_offline", {})
 
     def shutdown(self, timeout: float = 5.0):
         """
@@ -226,13 +252,7 @@ class TradingLogger:
         self._queue.put_nowait((event_type, payload))
 
     def _warmup_connection(self):
-        """Force libpq/OpenSSL to initialise in the main thread.
-
-        Makes one real TCP connection to PostgreSQL and immediately closes it.
-        This is called from __init__ (main thread) before the background writer
-        thread starts and before any Binance HTTPS calls happen.  After this,
-        OpenSSL's one-time global initialisation is complete and thread-safe.
-        """
+        """Force libpq/OpenSSL to initialise in the main thread."""
         try:
             engine = create_engine(
                 self._db_url,
@@ -245,30 +265,14 @@ class TradingLogger:
             engine.dispose()
             _file_log.info("DB warmup connection OK — libpq/OpenSSL initialised")
         except Exception as e:
-            # Warmup failure is non-fatal: the background thread will retry.
-            # We still get the single-threaded init benefit for subsequent calls.
             _file_log.warning(f"DB warmup failed (non-fatal): {e}")
 
     def _get_session(self):
-        """Lazily create the SQLAlchemy engine + session on first use in the thread.
-
-        NullPool is critical here.  SQLAlchemy's default QueuePool calls
-        psycopg2.connect() at unpredictable times (health pings, replenishment)
-        from the background thread.  libpq uses OpenSSL internally, and if that
-        first connect() races with the main thread's active Binance HTTPS socket
-        (also OpenSSL), both sides try to initialise OpenSSL simultaneously,
-        corrupting the allocator → free(): invalid pointer.
-
-        The real fix is _warmup_connection() called in __init__ from the MAIN
-        thread before any background thread or HTTPS call starts.  That forces
-        libpq/OpenSSL to fully initialise once, single-threaded.  After that,
-        modern OpenSSL is thread-safe.  NullPool is kept as a secondary defence:
-        it ensures no surprise connect() calls from the background thread.
-        """
+        """Lazily create the SQLAlchemy engine + session on first use in the thread."""
         if self._Session is None:
             self._engine = create_engine(
                 self._db_url,
-                poolclass=NullPool,   # no pool → no surprise connect() calls
+                poolclass=NullPool,
                 echo=False,
                 connect_args={"connect_timeout": 10},
             )
@@ -281,8 +285,6 @@ class TradingLogger:
         Runs until _stop_event is set AND the queue is empty.
         """
         # In-memory maps from client-side keys → DB integer ids
-        # (session_key str → TradingSession.id)
-        # (trade_key str   → Trade.id)
         session_id_map: Dict[str, int] = {}
         trade_id_map:   Dict[str, int] = {}
 
@@ -322,6 +324,24 @@ class TradingLogger:
                         sid = session_id_map.get(payload.get("session_key", ""))
                         self._write_system_log(db, payload, sid)
 
+                    elif event_type == "activity_log":
+                        sid = session_id_map.get(payload.get("session_key", ""))
+                        self._write_activity_log(db, payload, sid)
+
+                    elif event_type == "pnl_snapshot":
+                        sid = session_id_map.get(payload.get("session_key", ""))
+                        self._write_pnl_snapshot(db, payload, sid)
+
+                    elif event_type == "heartbeat":
+                        # Resolve session_key → session_id if present
+                        sk = payload.pop("session_key", "")
+                        if sk:
+                            payload["session_id"] = session_id_map.get(sk)
+                        self._write_heartbeat(db, payload)
+
+                    elif event_type == "mark_offline":
+                        self._write_mark_offline(db)
+
                 except Exception as e:
                     db.rollback()
                     _file_log.error(
@@ -339,21 +359,19 @@ class TradingLogger:
     # ─── SQL Writers (run inside background thread) ────────────────────
 
     def _write_open_session(self, db, p: Dict) -> Optional[int]:
-        """INSERT into trading_sessions. Returns the new row id."""
-        session = TradingSession(
-            date=p["screening_time"],
+        """INSERT into sessions. Returns the new row id."""
+        session = Session(
+            date=p["screening_time"].date() if hasattr(p["screening_time"], "date") else p["screening_time"],
             mode=p["mode"],
             initial_balance=p["initial_balance"],
             screening_time=p["screening_time"],
-            trading_start_time=p["screening_time"],
+            trading_start=p["screening_time"],
             total_trades=0,
             winning_trades=0,
             losing_trades=0,
-            emergency_stop=False,
             daily_limit_hit=False,
         )
 
-        # JSONB write — isolated so failure here doesn't lose the whole row
         try:
             session.screened_coins = _safe_json(p["screened_coins"])
         except Exception as e:
@@ -401,8 +419,8 @@ class TradingLogger:
         db.commit()
 
     def _write_close_session(self, db, p: Dict, session_id: int):
-        """UPDATE trading_sessions with end-of-day summary."""
-        session = db.query(TradingSession).filter(TradingSession.id == session_id).first()
+        """UPDATE sessions with end-of-day summary."""
+        session = db.query(Session).filter(Session.id == session_id).first()
         if session is None:
             _file_log.error(f"close_session: Session id={session_id} not found")
             return
@@ -411,7 +429,7 @@ class TradingLogger:
         session.total_trades = p["total_trades"]
         session.winning_trades = p["winning_trades"]
         session.losing_trades = p["losing_trades"]
-        session.trading_end_time = p["trading_end_time"]
+        session.trading_end = p["trading_end"]
         session.daily_limit_hit = p["daily_limit_hit"]
         session.stop_reason = p["stop_reason"]
         db.commit()
@@ -421,12 +439,11 @@ class TradingLogger:
         log = SystemLog(
             timestamp=p["timestamp"],
             level=p["level"],
-            category=p["category"],
+            source=p["source"],
             message=p["message"],
             session_id=session_id,
             exception=p.get("exception", ""),
         )
-        # JSONB write — isolated
         try:
             log.extra_data = _safe_json(p.get("extra_data")) or {}
         except Exception as e:
@@ -435,3 +452,63 @@ class TradingLogger:
 
         db.add(log)
         db.commit()
+
+    def _write_activity_log(self, db, p: Dict, session_id: Optional[int]):
+        """INSERT into activity_log."""
+        if session_id is None:
+            return
+        entry = ActivityLog(
+            session_id=session_id,
+            timestamp=p["timestamp"],
+            message=p["message"],
+        )
+        db.add(entry)
+        db.commit()
+
+    def _write_pnl_snapshot(self, db, p: Dict, session_id: Optional[int]):
+        """INSERT into pnl_snapshots."""
+        if session_id is None:
+            return
+        snap = PnLSnapshot(
+            session_id=session_id,
+            timestamp=p["timestamp"],
+            equity=p["equity"],
+            pnl=p["pnl"],
+        )
+        db.add(snap)
+        db.commit()
+
+    def _write_heartbeat(self, db, p: Dict):
+        """UPSERT into bot_heartbeat (bot_id='main')."""
+        p["last_updated"] = datetime.utcnow()
+
+        # Convert session_started from ISO string to datetime if needed
+        if "session_started" in p and isinstance(p["session_started"], str):
+            try:
+                p["session_started"] = datetime.fromisoformat(p["session_started"])
+            except (ValueError, TypeError):
+                p.pop("session_started", None)
+
+        # Sanitize JSONB fields
+        for key in ("guardrail_status", "coin_table", "screened_coins"):
+            if key in p:
+                p[key] = _safe_json(p[key])
+
+        row = db.query(BotHeartbeat).filter(BotHeartbeat.bot_id == "main").first()
+        if row is None:
+            row = BotHeartbeat(bot_id="main")
+            db.add(row)
+
+        for key, value in p.items():
+            if hasattr(row, key):
+                setattr(row, key, value)
+
+        db.commit()
+
+    def _write_mark_offline(self, db):
+        """Set heartbeat status to 'offline'."""
+        row = db.query(BotHeartbeat).filter(BotHeartbeat.bot_id == "main").first()
+        if row:
+            row.status = "offline"
+            row.last_updated = datetime.utcnow()
+            db.commit()

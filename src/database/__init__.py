@@ -2,11 +2,12 @@
 
 from .models import (
     Base,
-    TradingSession,
+    Session,
     Trade,
-    DailyPerformance,
+    ActivityLog,
     SystemLog,
-    AgentState,
+    PnLSnapshot,
+    BotHeartbeat,
     create_db_engine,
     get_session_maker,
     init_database,
@@ -14,11 +15,12 @@ from .models import (
 
 __all__ = [
     'Base',
-    'TradingSession',
+    'Session',
     'Trade',
-    'DailyPerformance',
+    'ActivityLog',
     'SystemLog',
-    'AgentState',
+    'PnLSnapshot',
+    'BotHeartbeat',
     'create_db_engine',
     'get_session_maker',
     'init_database',

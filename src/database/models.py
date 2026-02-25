@@ -1,13 +1,16 @@
 """
 Database Models for Asymptotic Zero Trading Bot
 
-Stores all trading activity, performance metrics, and system logs in PostgreSQL.
+Single source of truth for all trading state. The JSON metrics file is eliminated;
+the dashboard reads from these tables + a live Binance poller.
 
 Tables:
-- trading_sessions: Daily trading sessions
-- trades: Individual trades executed
-- daily_performance: Aggregated daily statistics
-- system_logs: Bot errors, warnings, events
+- sessions:       One row per screening cycle (typically daily)
+- trades:         Individual trade open/close records
+- activity_log:   Rolling human-readable activity log (survives restart)
+- system_logs:    WARNING/ERROR/CRITICAL log entries
+- pnl_snapshots:  Periodic equity snapshots for PnL chart
+- bot_heartbeat:  Single-row UPSERT — "what is the bot doing now?"
 """
 
 from datetime import datetime
@@ -15,281 +18,180 @@ from sqlalchemy import (
     create_engine,
     Column,
     Integer,
+    SmallInteger,
     Float,
     String,
     DateTime,
+    Date,
     Boolean,
     Text,
     ForeignKey,
     Index,
 )
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, relationship
+from sqlalchemy.orm import relationship
 from sqlalchemy.dialects.postgresql import JSONB
-import os
 
 Base = declarative_base()
 
 
-class TradingSession(Base):
-    """
-    Represents a daily trading session.
-    One row per trading day.
-    """
+class Session(Base):
+    """One row per screening cycle (typically daily)."""
 
-    __tablename__ = "trading_sessions"
+    __tablename__ = "sessions"
 
     id = Column(Integer, primary_key=True)
-    date = Column(DateTime, nullable=False, unique=True, index=True)
-
-    # Configuration
-    mode = Column(String(20), nullable=False)  # 'testnet' or 'live'
+    date = Column(Date)
+    mode = Column(String(20), nullable=False)
     initial_balance = Column(Float, nullable=False)
-
-    # Screening results
-    screened_coins = Column(
-        JSONB
-    )  # {'gainers': [...], 'losers': [...], 'gainers_pct': [...], 'losers_pct': [...]}
-
-    # Session timing
-    screening_time = Column(DateTime)
-    trading_start_time = Column(DateTime)
-    trading_end_time = Column(DateTime)
-
-    # Performance
     final_balance = Column(Float)
     total_pnl = Column(Float)
+    screened_coins = Column(JSONB)
+    screening_time = Column(DateTime(timezone=True))
+    trading_start = Column(DateTime(timezone=True))
+    trading_end = Column(DateTime(timezone=True))
     total_trades = Column(Integer, default=0)
     winning_trades = Column(Integer, default=0)
     losing_trades = Column(Integer, default=0)
-
-    # Safety flags
-    emergency_stop = Column(Boolean, default=False)
     daily_limit_hit = Column(Boolean, default=False)
     stop_reason = Column(String(200))
-
-    # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
+    updated_at = Column(DateTime(timezone=True), default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relationships
-    trades = relationship(
-        "Trade", back_populates="session", cascade="all, delete-orphan"
-    )
-    daily_performance = relationship(
-        "DailyPerformance",
-        back_populates="session",
-        uselist=False,
-        cascade="all, delete-orphan",
-    )
+    trades = relationship("Trade", back_populates="session", cascade="all, delete-orphan")
+    activity_entries = relationship("ActivityLog", back_populates="session", cascade="all, delete-orphan")
+    pnl_snapshots = relationship("PnLSnapshot", back_populates="session", cascade="all, delete-orphan")
 
     def __repr__(self):
-        return f"<TradingSession(date={self.date}, pnl={self.total_pnl}, trades={self.total_trades})>"
+        return f"<Session(date={self.date}, pnl={self.total_pnl}, trades={self.total_trades})>"
 
 
 class Trade(Base):
-    """
-    Individual trade execution record.
-    One row per open/close action.
-    """
+    """Individual trade open/close record."""
 
     __tablename__ = "trades"
 
     id = Column(Integer, primary_key=True)
-    session_id = Column(
-        Integer, ForeignKey("trading_sessions.id"), nullable=False, index=True
-    )
-
-    # Trade details
-    timestamp = Column(DateTime, nullable=False, index=True)
+    session_id = Column(Integer, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
     symbol = Column(String(20), nullable=False, index=True)
-    coin_rank = Column(Integer)  # 0-19 (gainer/loser rank)
+    coin_rank = Column(SmallInteger)
     is_gainer = Column(Boolean)
-
-    # Action
-    action_type = Column(
-        String(20), nullable=False
-    )  # 'open', 'close', 'close_all', etc.
-    action_id = Column(Integer, nullable=False)  # Raw action number from agent
-    side = Column(String(10))  # 'LONG' or 'SHORT'
-
-    # Execution
+    action_type = Column(String(10), nullable=False)  # 'open' or 'close'
+    action_id = Column(SmallInteger)
+    side = Column(String(5))  # 'LONG' or 'SHORT'
     quantity = Column(Float)
     entry_price = Column(Float)
     exit_price = Column(Float)
-
-    # Performance
     pnl = Column(Float, default=0.0)
     pnl_percent = Column(Float)
-    fees = Column(Float, default=0.0)
-    slippage = Column(Float, default=0.0)
-
-    # Agent decision
-    raw_action = Column(Integer)  # Original agent action before guardrails
-    filtered_action = Column(Integer)  # Action after guardrails
-    action_blocked = Column(Boolean, default=False)
-    block_reason = Column(String(100))
-
-    # State at time of trade
-    agent_q_value = Column(Float)  # Q-value for selected action
+    agent_q_value = Column(Float)
     portfolio_value = Column(Float)
-    open_positions = Column(Integer)
-
-    # Binance order details
-    order_id = Column(String(100))
-    order_status = Column(String(20))
-    order_response = Column(JSONB)  # Full order response from Binance
-
-    # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow)
+    open_positions = Column(SmallInteger)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow)
 
     # Relationships
-    session = relationship("TradingSession", back_populates="trades")
+    session = relationship("Session", back_populates="trades")
 
-    # Indexes for common queries
     __table_args__ = (
         Index("idx_trade_timestamp", "timestamp"),
         Index("idx_trade_symbol", "symbol"),
-        Index("idx_trade_pnl", "pnl"),
     )
 
     def __repr__(self):
-        return (
-            f"<Trade(symbol={self.symbol}, action={self.action_type}, pnl={self.pnl})>"
-        )
+        return f"<Trade(symbol={self.symbol}, action={self.action_type}, pnl={self.pnl})>"
 
 
-class DailyPerformance(Base):
-    """
-    Aggregated daily performance metrics.
-    Calculated at end of each trading day.
-    """
+class ActivityLog(Base):
+    """Rolling human-readable activity log. Survives restart."""
 
-    __tablename__ = "daily_performance"
+    __tablename__ = "activity_log"
 
     id = Column(Integer, primary_key=True)
-    session_id = Column(
-        Integer,
-        ForeignKey("trading_sessions.id"),
-        nullable=False,
-        unique=True,
-        index=True,
-    )
-    date = Column(DateTime, nullable=False, unique=True, index=True)
-
-    # Performance metrics
-    total_pnl = Column(Float, nullable=False)
-    pnl_percent = Column(Float)
-    win_rate = Column(Float)  # Percentage
-    profit_factor = Column(Float)
-
-    # Trading statistics
-    total_trades = Column(Integer)
-    winning_trades = Column(Integer)
-    losing_trades = Column(Integer)
-    avg_win = Column(Float)
-    avg_loss = Column(Float)
-    largest_win = Column(Float)
-    largest_loss = Column(Float)
-
-    # Risk metrics
-    max_drawdown = Column(Float)
-    sharpe_ratio = Column(Float)  # Calculated over rolling window
-
-    # Activity
-    actions_taken = Column(Integer)
-    actions_blocked = Column(Integer)
-    guardrail_blocks = Column(JSONB)  # {'cooldown': 10, 'concentration': 5, ...}
-
-    # Comparison to backtest
-    expected_pnl = Column(Float)  # From backtest
-    performance_ratio = Column(Float)  # Actual / Expected
-
-    # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow)
+    session_id = Column(Integer, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    timestamp = Column(DateTime(timezone=True), default=datetime.utcnow)
+    message = Column(Text, nullable=False)
 
     # Relationships
-    session = relationship("TradingSession", back_populates="daily_performance")
+    session = relationship("Session", back_populates="activity_entries")
 
     def __repr__(self):
-        return f"<DailyPerformance(date={self.date}, pnl={self.total_pnl}, wr={self.win_rate}%)>"
+        return f"<ActivityLog({self.message[:50]})>"
 
 
 class SystemLog(Base):
-    """
-    System events, errors, warnings.
-    Stores important bot lifecycle events.
-    """
+    """WARNING/ERROR/CRITICAL log entries from all Python loggers."""
 
     __tablename__ = "system_logs"
 
     id = Column(Integer, primary_key=True)
-    timestamp = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
-
-    # Log details
-    level = Column(
-        String(10), nullable=False, index=True
-    )  # 'INFO', 'WARNING', 'ERROR', 'CRITICAL'
-    category = Column(
-        String(50), nullable=False, index=True
-    )  # 'api', 'trading', 'agent', 'database', 'system'
+    session_id = Column(Integer, ForeignKey("sessions.id", ondelete="SET NULL"), index=True)
+    timestamp = Column(DateTime(timezone=True), default=datetime.utcnow, index=True)
+    level = Column(String(10), nullable=False, index=True)
+    source = Column(String(50), nullable=False)
     message = Column(Text, nullable=False)
+    exception = Column(Text)
+    extra_data = Column(JSONB)
 
-    # Context
-    session_id = Column(Integer, ForeignKey("trading_sessions.id"), index=True)
-    trade_id = Column(Integer, ForeignKey("trades.id"), index=True)
-
-    # Additional data
-    exception = Column(Text)  # Full exception traceback if error
-    extra_data = Column(JSONB)  # Any additional context
-
-    # Indexes
     __table_args__ = (
         Index("idx_log_level", "level"),
         Index("idx_log_timestamp", "timestamp"),
-        Index("idx_log_category", "category"),
     )
 
     def __repr__(self):
         return f"<SystemLog({self.level}: {self.message[:50]})>"
 
 
-class AgentState(Base):
-    """
-    Periodic snapshots of agent internal state.
-    Useful for debugging and analysis.
-    """
+class PnLSnapshot(Base):
+    """Periodic equity snapshots for PnL chart seeding."""
 
-    __tablename__ = "agent_states"
+    __tablename__ = "pnl_snapshots"
 
     id = Column(Integer, primary_key=True)
-    session_id = Column(
-        Integer, ForeignKey("trading_sessions.id"), nullable=False, index=True
-    )
-    timestamp = Column(DateTime, nullable=False, index=True)
+    session_id = Column(Integer, ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    timestamp = Column(DateTime(timezone=True), nullable=False)
+    equity = Column(Float, nullable=False)
+    pnl = Column(Float, nullable=False)
 
-    # Agent internal state
-    epsilon = Column(Float)  # Current exploration rate
-    replay_buffer_size = Column(Integer)
-    avg_q_value = Column(Float)
-    max_q_value = Column(Float)
-
-    # Model metrics
-    recent_loss = Column(Float)  # Most recent training loss
-
-    # Portfolio state
-    portfolio_value = Column(Float)
-    cash = Column(Float)
-    open_positions = Column(Integer)
-    position_details = Column(JSONB)  # Full position info
-
-    # Market state snapshot
-    current_coins = Column(JSONB)  # Current trading universe
-
-    created_at = Column(DateTime, default=datetime.utcnow)
+    # Relationships
+    session = relationship("Session", back_populates="pnl_snapshots")
 
     def __repr__(self):
-        return f"<AgentState(timestamp={self.timestamp}, portfolio={self.portfolio_value})>"
+        return f"<PnLSnapshot(equity={self.equity}, pnl={self.pnl})>"
+
+
+class BotHeartbeat(Base):
+    """
+    Single-row UPSERT — the dashboard's sole "what is the bot doing now?" query.
+
+    Dashboard query: SELECT * FROM bot_heartbeat WHERE bot_id = 'main'
+    """
+
+    __tablename__ = "bot_heartbeat"
+
+    bot_id = Column(String(20), primary_key=True, default="main")
+    session_id = Column(Integer, ForeignKey("sessions.id", ondelete="SET NULL"))
+    status = Column(String(20))  # 'running', 'sleeping', 'offline'
+    session_started = Column(DateTime(timezone=True))
+    last_updated = Column(DateTime(timezone=True))
+    agent_status = Column(String(20))
+    epsilon = Column(Float)
+    current_step = Column(Integer)
+    last_action = Column(String(100))
+    avg_q = Column(Float)
+    current_balance = Column(Float)
+    initial_balance = Column(Float)
+    trade_count = Column(Integer)
+    winning_trades = Column(Integer)
+    losing_trades = Column(Integer)
+    guardrail_status = Column(JSONB)
+    coin_table = Column(JSONB)
+    screened_coins = Column(JSONB)
+    trading_mode = Column(String(20))
+
+    def __repr__(self):
+        return f"<BotHeartbeat(status={self.status}, step={self.current_step})>"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -298,11 +200,9 @@ class AgentState(Base):
 
 
 def get_database_url():
-    """Get database URL from environment/Infisical."""
-    # This will be populated by Infisical
-    return os.getenv(
-        "DATABASE_URL", "postgresql://user:password@localhost:5432/asymptotic_zero"
-    )
+    """Get database URL from Infisical (falls back to env var)."""
+    from src.config.secrets import get_secret
+    return get_secret("DATABASE_URL")
 
 
 def create_db_engine(database_url=None):
@@ -310,50 +210,46 @@ def create_db_engine(database_url=None):
     url = database_url or get_database_url()
     return create_engine(
         url,
-        pool_pre_ping=True,  # Verify connections before using
+        pool_pre_ping=True,
         pool_size=10,
         max_overflow=20,
-        echo=False,  # Set to True for SQL debugging
+        echo=False,
     )
 
 
 def get_session_maker(engine=None):
     """Create session maker."""
+    from sqlalchemy.orm import sessionmaker
     if engine is None:
         engine = create_db_engine()
     return sessionmaker(bind=engine)
 
 
 def init_database(database_url=None):
-    """
-    Initialize database - create all tables.
-    Run this once during deployment setup.
-    """
+    """Initialize database - create all tables."""
     engine = create_db_engine(database_url)
     Base.metadata.create_all(engine)
-    print("✅ Database tables created successfully")
+    print("Database tables created successfully")
     return engine
 
 
 def drop_all_tables(database_url=None):
-    """
-    Drop all tables - USE WITH CAUTION!
-    Only for development/testing.
-    """
+    """Drop all tables - USE WITH CAUTION!"""
     engine = create_db_engine(database_url)
     Base.metadata.drop_all(engine)
-    print("⚠️  All tables dropped")
+    print("All tables dropped")
 
 
 if __name__ == "__main__":
-    # Test database connection and create tables
     import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
     if len(sys.argv) > 1 and sys.argv[1] == "init":
         print("Initializing database...")
         init_database()
     elif len(sys.argv) > 1 and sys.argv[1] == "drop":
-        response = input("⚠️  Are you SURE you want to drop all tables? Type 'YES': ")
+        response = input("Are you SURE you want to drop all tables? Type 'YES': ")
         if response == "YES":
             drop_all_tables()
         else:

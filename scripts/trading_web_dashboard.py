@@ -19,7 +19,6 @@ Dependencies:
 import argparse
 import asyncio
 import json
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -40,9 +39,6 @@ from binance.client import Client as BinanceClient
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DEFAULT_PORT     = 8585
-DEFAULT_LOG_DIR  = "logs/trading"
-TRADING_METRICS_FILENAME = "live_trading_metrics.json"
-TRADES_FILENAME = "live_trades.json"
 
 app = FastAPI(title="Asymptotic Zero Trading Dashboard", docs_url=None, redoc_url=None)
 
@@ -52,9 +48,6 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
-
-# Will be set at startup from CLI args
-LOG_DIR: Path = Path(DEFAULT_LOG_DIR)
 
 # ── Live Binance State ────────────────────────────────────────────────────────
 _binance_client: BinanceClient | None = None
@@ -188,7 +181,7 @@ def _load_session_pnl() -> list:
         from sqlalchemy import text
         with _db_engine.connect() as conn:
             rows = conn.execute(text(
-                "SELECT date, total_pnl FROM trading_sessions "
+                "SELECT date, total_pnl FROM sessions "
                 "WHERE total_pnl IS NOT NULL ORDER BY date ASC"
             )).fetchall()
         return [
@@ -204,127 +197,219 @@ def _load_session_pnl() -> list:
         return []
 
 
-def _find_trading_metrics_file() -> Path | None:
-    """Find the trading metrics JSON file."""
-    direct = LOG_DIR / TRADING_METRICS_FILENAME
-    if direct.exists():
-        return direct
-    
-    # Fallback: find newest file anywhere under LOG_DIR
-    candidates = sorted(LOG_DIR.rglob(TRADING_METRICS_FILENAME), key=os.path.getmtime, reverse=True)
-    return candidates[0] if candidates else None
+def _load_heartbeat() -> Optional[dict]:
+    """Load bot_heartbeat row from DB. Returns None if unavailable."""
+    if _db_engine is None:
+        return None
+    try:
+        from sqlalchemy import text
+        with _db_engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT status, session_started, last_updated, agent_status, "
+                "epsilon, current_step, last_action, avg_q, "
+                "current_balance, initial_balance, trade_count, "
+                "winning_trades, losing_trades, guardrail_status, "
+                "coin_table, screened_coins, trading_mode, session_id "
+                "FROM bot_heartbeat WHERE bot_id = 'main'"
+            )).fetchone()
+        if row is None:
+            return None
+        return {
+            "status": row[0],
+            "session_started": row[1].isoformat() if row[1] else None,
+            "last_updated": row[2].isoformat() if row[2] else None,
+            "agent_status": row[3],
+            "epsilon": row[4],
+            "current_step": row[5],
+            "last_action": row[6],
+            "avg_q": row[7],
+            "current_balance": row[8],
+            "initial_balance": row[9],
+            "trade_count": row[10],
+            "winning_trades": row[11] or 0,
+            "losing_trades": row[12] or 0,
+            "guardrail_status": row[13] or {},
+            "coin_table": row[14] or [],
+            "screened_coins": row[15],
+            "trading_mode": row[16],
+            "session_id": row[17],
+        }
+    except Exception:
+        return None
 
-def _find_trades_file() -> Path | None:
-    """Find the trades JSON file."""
-    direct = LOG_DIR / TRADES_FILENAME
-    if direct.exists():
-        return direct
-    
-    # Fallback: find newest file anywhere under LOG_DIR
-    candidates = sorted(LOG_DIR.rglob(TRADES_FILENAME), key=os.path.getmtime, reverse=True)
-    return candidates[0] if candidates else None
+
+def _load_activity_log(session_id: int) -> list:
+    """Load recent activity log entries for a session."""
+    if _db_engine is None or session_id is None:
+        return []
+    try:
+        from sqlalchemy import text
+        with _db_engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT timestamp, message FROM activity_log "
+                "WHERE session_id = :sid ORDER BY timestamp DESC LIMIT 50"
+            ), {"sid": session_id}).fetchall()
+        return [
+            {
+                "time": row[0].strftime("%H:%M:%S") if row[0] else "",
+                "message": row[1],
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
+
+
+def _load_error_log(session_id: int) -> list:
+    """Load recent system log entries (WARNING/ERROR) for a session."""
+    if _db_engine is None or session_id is None:
+        return []
+    try:
+        from sqlalchemy import text
+        with _db_engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT timestamp, level, source, message FROM system_logs "
+                "WHERE session_id = :sid ORDER BY timestamp DESC LIMIT 50"
+            ), {"sid": session_id}).fetchall()
+        return [
+            {
+                "time": row[0].strftime("%H:%M:%S") if row[0] else "",
+                "level": row[1],
+                "source": row[2],
+                "message": row[3],
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
+
+
+def _load_pnl_history(session_id: int) -> list:
+    """Load PnL snapshots for a session (seeds the PnL chart on page load)."""
+    if _db_engine is None or session_id is None:
+        return []
+    try:
+        from sqlalchemy import text
+        with _db_engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT timestamp, pnl FROM pnl_snapshots "
+                "WHERE session_id = :sid ORDER BY timestamp ASC"
+            ), {"sid": session_id}).fetchall()
+        return [
+            {"t": row[0].isoformat() if row[0] else "", "pnl": float(row[1])}
+            for row in rows
+        ]
+    except Exception:
+        return []
+
+
+def _load_recent_trades(session_id: int) -> list:
+    """Load recent closed trades for a session."""
+    if _db_engine is None or session_id is None:
+        return []
+    try:
+        from sqlalchemy import text
+        with _db_engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT timestamp, symbol, side, entry_price, exit_price, pnl, pnl_percent "
+                "FROM trades WHERE session_id = :sid AND action_type = 'close' "
+                "ORDER BY timestamp DESC LIMIT 20"
+            ), {"sid": session_id}).fetchall()
+        return [
+            {
+                "timestamp": row[0].isoformat() if row[0] else "",
+                "symbol": row[1],
+                "side": row[2],
+                "entry_price": round(float(row[3] or 0), 6),
+                "exit_price": round(float(row[4] or 0), 6),
+                "pnl": round(float(row[5] or 0), 4),
+                "pnl_pct": round(float(row[6] or 0), 2),
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
+
 
 def _load_trading_metrics() -> dict:
-    """Load trading metrics or return placeholder if not available."""
-    path = _find_trading_metrics_file()
-    if path is None:
+    """Load trading metrics from bot_heartbeat + activity/error logs, overlay live Binance data."""
+    hb = _load_heartbeat()
+
+    if hb is None or hb.get("status") == "offline" or hb.get("session_started") is None:
         data = {
-            "status": "waiting",
+            "status": hb["status"] if hb else "waiting",
             "message": "Waiting for trading bot to start...",
-            "session_started": None,
+            "session_started": hb.get("session_started") if hb else None,
             "current_balance": 0,
-            "initial_balance": 10000,
+            "initial_balance": 0,
             "total_pnl": 0,
+            "today_pnl": 0,
             "win_rate": 0,
             "trade_count": 0,
             "current_positions": [],
             "recent_trades": [],
-            "agent_status": "offline",
+            "agent_status": hb.get("agent_status", "offline") if hb else "offline",
             "guardrail_status": {},
-            "last_updated": None,
+            "last_updated": hb.get("last_updated") if hb else None,
+            "activity_log": [],
+            "error_log": [],
+            "pnl_history": [],
+            "coin_table": [],
+            "screened_coins": None,
+            "trading_mode": hb.get("trading_mode") if hb else None,
         }
     else:
-        try:
-            with open(path) as f:
-                data = json.load(f)
-            data["status"] = "running" if data.get("session_started") else "waiting"
-            data["metrics_file"] = str(path)
-        except (json.JSONDecodeError, OSError) as e:
-            data = {
-                "status": "error",
-                "message": f"Could not read trading metrics: {e}",
-                "session_started": None,
-                "current_balance": 0,
-                "initial_balance": 10000,
-                "total_pnl": 0,
-                "win_rate": 0,
-                "trade_count": 0,
-                "current_positions": [],
-                "recent_trades": [],
-                "agent_status": "error",
-                "guardrail_status": {},
-                "last_updated": None,
-            }
+        session_id = hb.get("session_id")
+        winning = hb.get("winning_trades", 0)
+        losing = hb.get("losing_trades", 0)
+        total = winning + losing
+
+        data = {
+            "status": hb["status"],
+            "session_started": hb["session_started"],
+            "current_balance": hb.get("current_balance", 0),
+            "initial_balance": hb.get("initial_balance", 0),
+            "total_pnl": (hb.get("current_balance") or 0) - (hb.get("initial_balance") or 0),
+            "today_pnl": 0,
+            "win_rate": winning / total if total > 0 else 0.0,
+            "trade_count": hb.get("trade_count", 0),
+            "current_positions": [],
+            "recent_trades": _load_recent_trades(session_id),
+            "agent_status": hb.get("agent_status", "active"),
+            "epsilon": hb.get("epsilon", 0),
+            "current_step": hb.get("current_step", 0),
+            "last_action": hb.get("last_action", ""),
+            "avg_q": hb.get("avg_q", 0),
+            "screened_coins": hb.get("screened_coins"),
+            "guardrail_status": hb.get("guardrail_status", {}),
+            "activity_log": _load_activity_log(session_id),
+            "error_log": _load_error_log(session_id),
+            "pnl_history": _load_pnl_history(session_id),
+            "coin_table": hb.get("coin_table", []),
+            "trading_mode": hb.get("trading_mode"),
+            "last_updated": hb.get("last_updated"),
+        }
 
     # Overlay live Binance data if available
     if _live_state["last_poll"] is not None:
-        # Save bot's leverage values — Binance testnet often returns wrong leverage (1x)
-        bot_leverage = {
-            p["symbol"]: p.get("leverage", 10)
-            for p in data.get("current_positions", [])
-            if isinstance(p, dict) and p.get("symbol")
-        }
         data["current_positions"] = _live_state["positions"]
-        # Patch any position where Binance returned wrong leverage
-        for lp in data["current_positions"]:
-            if lp.get("leverage", 1) <= 1:
-                lp["leverage"] = bot_leverage.get(lp["symbol"], 10)
-        # live_balance = totalMarginBalance (wallet + unrealized) — true equity
         live_balance = _live_state["balance_usdt"]
 
-        # Capture bot-file values BEFORE overwriting current_balance
-        bot_equity_at_write = float(data.get("current_balance") or live_balance)
-        bot_today_pnl_at_write = float(data.get("today_pnl") or 0)
-
         data["current_balance"] = live_balance
-        if not data.get("session_started"):
-            data["initial_balance"] = 0
-            data["total_pnl"] = 0
-            data["today_pnl"] = 0
-        else:
+        if data.get("session_started"):
             initial = data.get("initial_balance") or 0
             if initial > 0:
-                # Session PnL: equity_now - wallet_at_session_start (updates every 2s)
-                data["total_pnl"] = live_balance - initial
-
-                # Guardrail daily PnL: same formula, keep live (updates every 2s)
-                if "guardrail_status" in data:
-                    data["guardrail_status"]["daily_pnl"] = live_balance - initial
-
-            # Today PnL: reconstruct wallet_at_day_start from bot's last write,
-            # then recompute against live equity (updates every 2s)
-            # wallet_at_day_start = bot_equity_at_write - bot_today_pnl_at_write
-            today_wallet_start = bot_equity_at_write - bot_today_pnl_at_write
-            if today_wallet_start > 0:
-                data["today_pnl"] = live_balance - today_wallet_start
+                pnl = live_balance - initial
+                data["total_pnl"] = pnl
+                data["today_pnl"] = pnl  # same as session PnL for now
+                if "guardrail_status" in data and isinstance(data["guardrail_status"], dict):
+                    data["guardrail_status"]["daily_pnl"] = pnl
 
         data["last_updated"] = _live_state["last_poll"]
         if _live_state["poll_error"]:
             data["poll_error"] = _live_state["poll_error"]
 
     return data
-
-def _load_trades() -> List[dict]:
-    """Load recent trades."""
-    path = _find_trades_file()
-    if path is None:
-        return []
-    
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError):
-        return []
 
 # ── API Endpoints ─────────────────────────────────────────────────────────────
 
@@ -1539,11 +1624,6 @@ async def get_metrics():
     """Return current trading metrics as JSON."""
     return JSONResponse(_load_trading_metrics())
 
-@app.get("/api/trades")
-async def get_trades():
-    """Return recent trades."""
-    return JSONResponse(_load_trades())
-
 @app.get("/api/session_pnl")
 async def get_session_pnl():
     """Return daily PnL bars anchored to the first session day, minimum 7 bars."""
@@ -1632,18 +1712,14 @@ def parse_args():
     p = argparse.ArgumentParser(description="Asymptotic Zero Trading Web Dashboard")
     p.add_argument("--port", type=int, default=DEFAULT_PORT, help="Port to run on")
     p.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to")
-    p.add_argument("--log-dir", type=str, default=DEFAULT_LOG_DIR, help="Log directory")
     return p.parse_args()
 
 def main():
     args = parse_args()
-    global LOG_DIR
-    LOG_DIR = Path(args.log_dir)
-    
-    print(f"🏦 Starting Trading Web Dashboard")
+
+    print(f"Starting Trading Web Dashboard")
     print(f"   Host: {args.host}")
     print(f"   Port: {args.port}")
-    print(f"   Log Dir: {LOG_DIR}")
     print(f"   Dashboard: http://{args.host}:{args.port}")
     print(f"   Tailscale: http://<tailscale-ip>:{args.port}")
     print(f"   API: http://{args.host}:{args.port}/api/metrics")

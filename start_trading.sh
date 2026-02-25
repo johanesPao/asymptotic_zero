@@ -169,7 +169,6 @@ start_web_dashboard() {
     setsid nohup python scripts/trading_web_dashboard.py \
         --port $WEB_DASHBOARD_PORT \
         --host $HOST \
-        --log-dir "$LOG_DIR" \
         < /dev/null > "$LOG_DIR/web_dashboard.log" 2>&1 &
     local dashboard_pid=$!
     disown $dashboard_pid
