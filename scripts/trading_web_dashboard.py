@@ -869,6 +869,14 @@ async def dashboard():
             </div>
         </div>
 
+        <!-- System Log (WARNING/ERROR from all components) -->
+        <div class="card" style="grid-column: 1 / -1;">
+            <h2 style="color:var(--red, #f05252);">System Log</h2>
+            <div id="error-log" style="max-height:200px;overflow-y:auto;font-family:monospace;font-size:11px;">
+                <div class="loading">No warnings or errors</div>
+            </div>
+        </div>
+
     </div>
     
     <script>
@@ -993,6 +1001,7 @@ async def dashboard():
             }
 
             updateActivityLog(data.activity_log || []);
+            updateErrorLog(data.error_log || []);
 
             // Update guardrails
             const guardrails = data.guardrail_status || {};
@@ -1212,6 +1221,27 @@ async def dashboard():
                 '<span style="margin-left:10px;">' + entry.message + '</span>' +
                 '</div>'
             ).join('');
+        }
+
+        function updateErrorLog(log) {
+            const container = document.getElementById('error-log');
+            if (!container) return;
+            if (!log || log.length === 0) {
+                container.innerHTML = '<div class="loading">No warnings or errors</div>';
+                return;
+            }
+            container.innerHTML = log.map(entry => {
+                const isErr = entry.level === 'ERROR';
+                const badge = isErr
+                    ? '<span style="color:#f05252;font-weight:700;margin:0 6px;">[ERR]</span>'
+                    : '<span style="color:#e6a23c;font-weight:700;margin:0 6px;">[WARN]</span>';
+                return '<div style="padding:3px 0;border-bottom:1px solid var(--border);">' +
+                    '<span style="color:var(--muted);">' + entry.time + '</span>' +
+                    badge +
+                    '<span style="color:var(--muted);font-size:10px;">' + (entry.source || '') + '</span> ' +
+                    '<span>' + entry.message + '</span>' +
+                    '</div>';
+            }).join('');
         }
 
         // ── Screened Coins Table ──────────────────────────────────────────────

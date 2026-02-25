@@ -11,6 +11,7 @@ Main trading loop that connects all components:
 v2: Added position reconciliation with Binance to prevent state divergence
 """
 
+import logging
 import sys
 from pathlib import Path
 import random
@@ -46,6 +47,29 @@ from src.trading.guardrails import GuardrailManager
 # DQNAgent (TensorFlow) is imported lazily inside __init__, AFTER the DB
 # warmup connection.  TensorFlow bundles its own libssl.so; if it loads
 # before psycopg2's first connect(), two OpenSSL instances clash → SIGSEGV.
+
+
+class _DashboardLogHandler(logging.Handler):
+    """Captures recent WARNING/ERROR log records for the web dashboard."""
+
+    def __init__(self, maxlen: int = 50):
+        super().__init__(level=logging.WARNING)
+        self._records: list = []
+        self._maxlen = maxlen
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._records.append({
+            "time": datetime.fromtimestamp(record.created).strftime("%H:%M:%S"),
+            "level": record.levelname,
+            "source": record.name.split(".")[-1],
+            "message": self.format(record),
+        })
+        if len(self._records) > self._maxlen:
+            self._records = self._records[-self._maxlen:]
+
+    @property
+    def entries(self) -> list:
+        return list(self._records)
 
 
 class TradingBot:
@@ -103,6 +127,10 @@ class TradingBot:
         self._session_started: str = ""
         self._pnl_history: list = []
         self._last_market_features: dict = {}
+
+        # System error log — captures WARNING/ERROR from ALL Python loggers
+        self._dashboard_log_handler = _DashboardLogHandler(maxlen=50)
+        logging.getLogger().addHandler(self._dashboard_log_handler)
 
         print("✅ DB logger initialized (libpq/OpenSSL warmed up)")
 
@@ -404,6 +432,7 @@ class TradingBot:
                     "daily_pnl": float(current_balance - self.initial_balance),
                 },
                 "activity_log": list(reversed(self._activity_log)),
+                "error_log": list(reversed(self._dashboard_log_handler.entries)),
                 "pnl_history": list(self._pnl_history),
                 "coin_table": coin_table,
                 "trading_mode": self.trading_mode,
