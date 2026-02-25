@@ -1050,11 +1050,26 @@ class TradingBot:
                 if should_screen:
                     # Close all before re-screening (not first run)
                     if last_screening_time is not None:
+                        # Sync with Binance first to remove ghost positions
+                        # that were liquidated or closed externally overnight.
+                        try:
+                            self._sync_positions_with_binance()
+                        except Exception as e:
+                            _log.warning(f"Pre-close sync failed: {e}")
+
                         for sym in list(self.executor.positions.keys()):
                             pos = self.executor.positions.get(sym)
                             if pos is None:
                                 continue
-                            result = self.executor.close_position(sym)
+                            # Retry up to 3 times — 07:00 WIB = 00:00 UTC
+                            # (Binance daily settlement) can cause transient rejects.
+                            result = None
+                            for attempt in range(3):
+                                result = self.executor.close_position(sym)
+                                if result is not None:
+                                    break
+                                if attempt < 2:
+                                    time.sleep(5)
                             if result:
                                 self._log_activity(
                                     f"Re-screening: closed {sym} ({pos['side']})"
@@ -1062,8 +1077,11 @@ class TradingBot:
                                 )
                             else:
                                 self._log_activity(
-                                    f"Re-screening: FAILED to close {sym} ({pos['side']})"
+                                    f"Re-screening: FAILED to close {sym}"
                                 )
+                                # Force-remove from cache so the bot doesn't
+                                # keep a stale position forever.
+                                self.executor.positions.pop(sym, None)
                         for sym in list(self.guardrails.position_history.keys()):
                             self.guardrails.record_position_closed(sym)
 

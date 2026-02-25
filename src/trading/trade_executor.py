@@ -338,11 +338,22 @@ class TradeExecutor:
                 del self.positions[symbol]
                 return None
 
+            # Round to lot step to avoid -1111 precision errors
+            size = self._round_quantity(symbol, size)
+            if size <= 0:
+                _log.error(
+                    f"close_position {symbol}: size rounded to 0 — removing stale cache entry"
+                )
+                del self.positions[symbol]
+                return None
+
             size_usdt = size * entry_price
 
-            # Place closing order first
+            # Place closing order with reduceOnly so we never accidentally
+            # open a new position if the original was already closed.
             order = self.client.futures_create_order(
-                symbol=symbol, side=side, type="MARKET", quantity=size
+                symbol=symbol, side=side, type="MARKET",
+                quantity=size, reduceOnly=True,
             )
 
             # Use actual fill price from order response
