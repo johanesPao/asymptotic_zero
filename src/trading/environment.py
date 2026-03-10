@@ -644,7 +644,8 @@ class TradingEnvironment:
         feature_cols = self.technical_indicators.get_feature_names()
         features = {}
         for coin_idx, df in self.episode_data.items():
-            row_idx = min(self.current_step, len(df) - 1)
+            # Use previous candle's TA values (current candle is not yet closed)
+            row_idx = min(max(self.current_step - 1, 0), len(df) - 1)
             row     = df[row_idx]
             values  = [
                 row[col].item() if col in df.columns else 0.0
@@ -670,7 +671,8 @@ class TradingEnvironment:
         all_adx     = []
 
         for coin_idx, df in self.episode_data.items():
-            end   = min(self.current_step + 1, len(df))
+            # Use data up to previous candle only (current candle not yet closed)
+            end   = min(self.current_step, len(df))
             start = max(0, end - vol_lb)
             if end - start < 2:
                 continue
@@ -681,7 +683,7 @@ class TradingEnvironment:
 
             # ADX from DataFrame if pre-computed, else approximate via |return| trend
             if "adx_14" in df.columns:
-                adx_val = float(df["adx_14"][min(self.current_step, len(df)-1)])
+                adx_val = float(df["adx_14"][min(max(self.current_step - 1, 0), len(df)-1)])
                 if not np.isnan(adx_val):
                     all_adx.append(adx_val / 100.0)  # normalize 0–100 → 0–1
 
@@ -695,11 +697,11 @@ class TradingEnvironment:
         # Normalize relative to a "typical" crypto vol of 0.005 per 5m candle
         vol_normalized = np.clip(realized_vol / 0.005, 0, 5) / 5.0
 
-        # 3. Market breadth — fraction of coins with positive return this step
+        # 3. Market breadth — fraction of coins with positive return last closed candle
         step_returns = []
         for coin_idx, df in self.episode_data.items():
-            if self.current_step >= 1 and self.current_step < len(df):
-                r = float(df["close"][self.current_step]) / float(df["close"][self.current_step - 1]) - 1
+            if self.current_step >= 2 and self.current_step - 1 < len(df):
+                r = float(df["close"][self.current_step - 1]) / float(df["close"][self.current_step - 2]) - 1
                 step_returns.append(r)
         breadth = float(np.mean([r > 0 for r in step_returns])) if step_returns else 0.5
 
@@ -715,7 +717,7 @@ class TradingEnvironment:
         # Use ratio of current window vol to full-episode vol approximation
         full_returns = []
         for coin_idx, df in self.episode_data.items():
-            end = min(self.current_step + 1, len(df))
+            end = min(self.current_step, len(df))
             if end >= 2:
                 closes = df["close"][:end].to_numpy().astype(np.float64)
                 full_returns.extend(np.diff(np.log(closes + 1e-8)).tolist())
@@ -730,7 +732,7 @@ class TradingEnvironment:
         for coin_idx, df in self.episode_data.items():
             if check_step < len(df) and self.current_step > check_step:
                 early_move  = float(df["close"][check_step]) / float(df["close"][warmup]) - 1
-                recent_move = float(df["close"][min(self.current_step, len(df)-1)]) / float(df["close"][warmup]) - 1
+                recent_move = float(df["close"][min(self.current_step - 1, len(df)-1)]) / float(df["close"][warmup]) - 1
                 if abs(early_move) > 1e-8:
                     persistence = np.clip(recent_move / early_move, -1, 2) / 2.0 + 0.5
                 break  # approximate from first coin; sufficient for a shaping signal
